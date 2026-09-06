@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnikey3021"
+version = "1.0.0"
+description = "Read/write toolkit and access-control system for the HID OMNIKEY 3021 contact smart card reader"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "panagiotis1226" }]
+keywords = ["omnikey", "3021", "smartcard", "pcsc", "iso7816", "sle4442", "access control"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: System :: Hardware",
+]
+dependencies = []
+
+[project.scripts]
+omnikey3021 = "omnikey3021.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["omnikey3021*"]
