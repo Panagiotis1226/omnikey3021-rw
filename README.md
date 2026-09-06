@@ -22,6 +22,7 @@ The reader's datasheet lists five specifications.  Each one maps to a layer of t
 | **EMVCo Terminal Level 1** | EMV-certified card interface, EMVCo operating mode | `ReaderConfig.set_operating_mode`, `ATR.emv_compliance()` (Book 1 ATR rules), `emv.py` read-only Level 2 (PSE/PPSE, GPO, AFL records, tags, ATC, log) |
 | **USB CCID** | CCID 1.1 class device driven by the OS driver | `ccid.py` (class descriptor: voltages, clocks, data rates, IFSD, exchange level, features; sysfs discovery), PC/SC part 10 TLV properties (VID/PID, firmware id), CCID escape |
 | **PC/SC** | host API (winscard / pcsc-lite) | `pcsc.py` ctypes binding: contexts, readers and groups, status change + hot-plug monitor, shared/exclusive/direct connect, reconnect, transactions, transmit, control, attributes |
+| **Calypso** | transit ticketing; dual-interface cards work on the contact interface | `calypso.py` read path (application/serial/startup, files, records) + secure-session read/write with a `CalypsoSam` (a SAM in a second reader), simulated card + SAM for tests |
 | **HBCI** | class 1 terminal for German home banking (DDV cards via CT-API) | `ctapi.py` (CT-API `CT_init/CT_data/CT_close` + CT-BCS over PC/SC, or a vendor CT-API library), `hbci.py` (DDV card: card id, bank records, PIN, MAC/sign, session keys, signature counter) |
 
 On top of that:
@@ -95,6 +96,13 @@ omnikey3021 hbci keys --pin 12345 --derive 3
 omnikey3021 ctapi "20 12 01 01 01 0F 00" "20 13 00 80"     # CT-API / CT-BCS over PC/SC
 omnikey3021 ctapi --dad icc "00 A4 04 00 08 A000000003021001"
 
+# Calypso transport cards (contact / dual-interface)
+omnikey3021 calypso info               # AID, serial, startup info, files
+omnikey3021 calypso dump               # every record of the standard transport files
+omnikey3021 calypso read --sfi 0x08    # event log
+omnikey3021 calypso write --sfi 0x09 --record 1 --data @contract.bin --sam-reader "OMNIKEY ... 1"  # needs a SAM
+omnikey3021 calypso counter --sfi 0x19 --decrease 1 --sam-reader "OMNIKEY ... 1"
+
 # USB CCID and PC/SC
 omnikey3021 ccid                       # CCID class descriptor (Linux sysfs) + part 10 properties
 omnikey3021 monitor                    # card insert/remove and reader hot-plug events
@@ -110,7 +118,7 @@ omnikey3021 reader reboot
 ```
 
 Global options: `--reader NAME`, `--protocol t0|t1`, `--timeout S`, `--trace`
-(print every APDU), `--simulate sle4442|iso|iso-t0|emv|hbci|empty` (+ `--sim-state FILE` to
+(print every APDU), `--simulate sle4442|iso|iso-t0|emv|hbci|calypso|empty` (+ `--sim-state FILE` to
 keep the simulated card between commands).
 
 ## Access-control system
@@ -157,7 +165,7 @@ with OmnikeyReader() as reader:                 # first OMNIKEY reader
 ```
 
 Module map: `pcsc` (ctypes PC/SC + `CardMonitor`), `reader`, `atr`, `apdu`, `tlv`, `iso7816`
-(+ `Iso7816CardExtended`), `memorycard`, `vendor`, `emv`, `ccid`, `hbci`, `ctapi`,
+(+ `Iso7816CardExtended`), `memorycard`, `vendor`, `emv`, `ccid`, `hbci`, `ctapi`, `calypso`,
 `access/` (`credential`, `store`, `controller`), `simulator`, `cli`.  More in [examples/](examples/).
 
 ## Try it without a reader

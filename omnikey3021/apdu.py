@@ -264,19 +264,22 @@ def transmit_apdu(transmit: Transmit, command: CommandAPDU | bytes, *, auto_get_
     """
     cmd = command if isinstance(command, CommandAPDU) else CommandAPDU.parse(bytes(command))
     raw = transmit(cmd.to_bytes())
-    if len(raw) < 2 and cmd.case == 4:
-        # Driver swallowed the response: fall back to case 3 + explicit GET RESPONSE.
+    if len(raw) < 2 and cmd.data and cmd.le is not None:
+        # Some CCID drivers (seen on macOS) swallow the response to a case-4 command
+        # when a T=0 card has data: resend as case 3, then fetch with GET RESPONSE.
         case3 = CommandAPDU(cmd.cla, cmd.ins, cmd.p1, cmd.p2, cmd.data, None, cmd.extended)
         raw = transmit(case3.to_bytes())
-        if len(raw) == 2 and raw == b"\x90\x00" and auto_get_response:
-            get_resp = CommandAPDU(cmd.cla & 0x03, 0xC0, 0x00, 0x00, le=cmd.le or 256)
-            fetched = transmit(get_resp.to_bytes())
-            if len(fetched) >= 2 and fetched[-2] in (0x90, 0x61, 0x62, 0x63):
+        if raw[-2:] == b"\x90\x00" and auto_get_response:
+            fetched = transmit(CommandAPDU(cmd.cla & 0x03, 0xC0, 0, 0, le=cmd.le or 256).to_bytes())
+            if len(fetched) >= 2:
                 raw = fetched
+        elif len(raw) >= 2 and raw[-2] == 0x6C:
+            raw = transmit(CommandAPDU(cmd.cla, cmd.ins, cmd.p1, cmd.p2, cmd.data, raw[-1] or 256, cmd.extended).to_bytes())
     if len(raw) < 2:
         raise OmnikeyError(
-            f"card or driver returned an empty response to {cmd.hex()} - try --trace to see the exchange, "
-            "--protocol t0/t1 to force a protocol, or --cla 94 for legacy Calypso cards"
+            f"empty response to {cmd.hex()} (the card returned no data). "
+            "The card may not support this command, or selection by this method. "
+            "Try --cla 94 (legacy Calypso), a different --protocol, or `omnikey3021 calypso info`."
         )
     resp = ResponseAPDU.from_bytes(raw)
     rounds = 0

@@ -812,3 +812,166 @@ def _sim_tlv_properties(self):
 
 SimulatedChannel.tlv_properties = _sim_tlv_properties  # type: ignore[attr-defined]
 SimulatedChannel.status = lambda self: self.reader.card  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Calypso transport card + SAM (simulated, sharing one key so the MAC flow works)
+# ---------------------------------------------------------------------------
+class SimulatedSam:
+    """A stand-in Calypso SAM.  The MAC scheme is internal to the simulator; a real
+    SAM uses DESFire/AES session keys.  Pair it with a SimulatedCalypsoCard sharing
+    the same ``key`` so open/close secure session authenticates end to end."""
+
+    def __init__(self, key: bytes = b"\x01" * 16):
+        self.key = key
+        self._serial = b""
+        self._challenge = b""
+        self._seed = b""
+        self._updates = bytearray()
+
+    def select_diversifier(self, serial: bytes) -> None:
+        self._serial = bytes(serial)
+
+    def get_challenge(self) -> bytes:
+        self._challenge = os.urandom(8)
+        return self._challenge
+
+    def digest_init(self, key_index: int, open_response: bytes) -> None:
+        self._seed = bytes([key_index]) + self._serial + self._challenge + bytes(open_response)
+        self._updates = bytearray()
+
+    def digest_update(self, apdu: bytes) -> None:
+        self._updates += bytes(apdu)
+
+    def digest_close(self) -> bytes:
+        return hmac.new(self.key, self._seed + bytes(self._updates), hashlib.sha256).digest()[:4]
+
+    def digest_authenticate(self, card_mac: bytes) -> bool:
+        expected = hmac.new(self.key, self._seed + bytes(self._updates) + b"CARD", hashlib.sha256).digest()[:4]
+        return hmac.compare_digest(expected, bytes(card_mac))
+
+
+class SimulatedCalypsoCard(SimulatedCard):
+    """A minimal Calypso Prime Rev3 transport card with the standard transport files."""
+
+    atr = bytes.fromhex("3B5F9600805A3F0608201223C46D4A188290 00".replace(" ", ""))
+    protocol = C.SCARD_PROTOCOL_T0
+    AID = bytes.fromhex("315449432E494341")
+
+    def __init__(self, key: bytes = b"\x01" * 16, serial: bytes | None = None):
+        self.key = key
+        self.serial = serial or bytes.fromhex("08201223C46D4A18")
+        self.startup = bytes([0x1D, 0x04, 0x06, 0x00, 0x11, 0x02, 0x01])  # buffer, platform, apptype ...
+        self.selected = False
+        self.files: dict[int, list[bytearray]] = {
+            0x07: [bytearray(b"\x24" + b"\x00" * 28)],                       # Environment & Holder
+            0x08: [bytearray(29) for _ in range(3)],                          # Event log
+            0x09: [bytearray(b"\x01" + b"\x00" * 28), bytearray(29)],         # Contracts
+            0x19: [bytearray(bytes.fromhex("000064") + bytes.fromhex("00000A") + b"\x00" * 23)],  # Counters
+        }
+        self.current_sfi: int | None = None
+        self._session_open = False
+        self._seed = b""
+        self._updates = bytearray()
+        self._card_challenge = b""
+
+    def reset(self) -> None:
+        self.selected = False
+        self._session_open = False
+
+    def _fci(self) -> bytes:
+        from .tlv import tlv
+
+        return tlv(0x6F, None, tlv(0x84, self.AID),
+                   tlv(0xA5, None, tlv(0xBF0C, None, tlv(0xC7, self.serial), tlv(0x53, self.startup)))).encode()
+
+    def _digest(self, cmd: bytes, resp: bytes) -> None:
+        if self._session_open:
+            self._updates += bytes(cmd) + bytes(resp)
+
+    def process(self, apdu: bytes) -> bytes:
+        try:
+            cmd = CommandAPDU.parse(apdu)
+        except ValueError:
+            return sw(0x6700)
+        if cmd.cla not in (0x00, 0x94):
+            return sw(0x6E00)
+        ins = cmd.ins
+
+        if ins == 0xA4 and cmd.p1 == 0x04:
+            if bytes(cmd.data) == self.AID:
+                self.selected = True
+                return self._fci() + SW_OK
+            return sw(0x6A82)
+        if not self.selected:
+            return sw(0x6985)
+
+        if ins == 0xA4:  # SELECT FILE by LID (accept, no FCI body)
+            return SW_OK
+        if ins == 0x84:  # GET CHALLENGE
+            return os.urandom(cmd.le or 8) + SW_OK
+
+        if ins == 0xB2:  # READ RECORDS
+            sfi = cmd.p2 >> 3
+            recs = self.files.get(sfi)
+            resp = (bytes(recs[cmd.p1 - 1]) + SW_OK) if recs and 1 <= cmd.p1 <= len(recs) else sw(0x6A83)
+            self._digest(apdu, resp)
+            return resp
+
+        if ins == 0x8A:  # OPEN SECURE SESSION
+            key_index = cmd.p2 & 0x07
+            self._card_challenge = os.urandom(4)
+            open_response = self._card_challenge
+            self._session_open = True
+            self._updates = bytearray()
+            self._seed = bytes([key_index]) + self.serial + bytes(cmd.data) + open_response
+            return open_response + SW_OK
+
+        if ins in (0xDC, 0xD2, 0xE2, 0x32, 0x30):  # in-session writes
+            if not self._session_open:
+                return sw(0x6982)
+            resp = self._write(cmd)
+            self._digest(apdu, resp)
+            return resp
+
+        if ins == 0x8E:  # CLOSE SECURE SESSION
+            if not self._session_open:
+                return sw(0x6985)
+            terminal_mac = bytes(cmd.data)
+            expected = hmac.new(self.key, self._seed + bytes(self._updates), hashlib.sha256).digest()[:4]
+            self._session_open = False
+            if not hmac.compare_digest(expected, terminal_mac):
+                return sw(0x6988)  # terminal not authenticated
+            card_mac = hmac.new(self.key, self._seed + bytes(self._updates) + b"CARD", hashlib.sha256).digest()[:4]
+            return card_mac + SW_OK
+
+        if ins == 0x20:  # VERIFY PIN
+            return SW_OK
+        return sw(0x6D00)
+
+    def _write(self, cmd: CommandAPDU) -> bytes:
+        sfi = cmd.p2 >> 3
+        recs = self.files.setdefault(sfi, [])
+        if cmd.ins == 0xDC:  # UPDATE RECORD
+            if not (1 <= cmd.p1 <= len(recs)):
+                return sw(0x6A83)
+            recs[cmd.p1 - 1] = bytearray(cmd.data.ljust(len(recs[cmd.p1 - 1]), b"\x00"))
+            return SW_OK
+        if cmd.ins == 0xE2:  # APPEND RECORD
+            recs.append(bytearray(cmd.data))
+            return SW_OK
+        if cmd.ins in (0x32, 0x30):  # INCREASE / DECREASE
+            if not recs:
+                return sw(0x6A83)
+            counter = recs[0]
+            idx = (cmd.p1) * 3
+            if idx + 3 > len(counter):
+                return sw(0x6A83)
+            cur = int.from_bytes(counter[idx:idx + 3], "big")
+            amount = int.from_bytes(cmd.data, "big")
+            new = cur + amount if cmd.ins == 0x32 else cur - amount
+            if new < 0 or new > 0xFFFFFF:
+                return sw(0x6A80)
+            counter[idx:idx + 3] = new.to_bytes(3, "big")
+            return new.to_bytes(3, "big") + SW_OK
+        return sw(0x6D00)

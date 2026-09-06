@@ -226,3 +226,49 @@ Python interface, for software that must go through the vendor library.
 
 The FinTS message layer (dialog initialisation, segments, HTTPS transport) is a banking client's
 job; hbci4java, AqBanking and similar can use the 3021 through PC/SC or CT-API without this toolkit.
+
+## 11. Calypso transport cards (`calypso.py`)
+
+Calypso is a transit ticketing standard.  Most Calypso cards are **contactless**
+(ISO 14443-B) and cannot be used with the contact-only 3021; **dual-interface**
+cards (with a contact plate) work.  The command set is ISO 7816-4 based, so the
+free-access read path needs nothing special; writing needs a **Calypso SAM**.
+
+Class byte: `00` (Rev 3.x) or `94` (Rev 2.4 legacy); the toolkit tries both on SELECT.
+
+| Operation | APDU | SAM? |
+|---|---|---|
+| Select application | `00 A4 04 00 08 <AID> 00` (`1TIC.ICA` = 31 54 49 43 2E 49 43 41); FCI has `C7` serial + `53` startup info | no |
+| Select file (LID) | `00 A4 08 00 02 <lid>` | no |
+| Read record | `00 B2 <rec> <SFI<<3 \| 04> 00` | no |
+| Read records | one READ RECORD per record (portable across layouts) | no |
+| Get data | `00 CA <tag>` | no |
+| Get challenge | `00 84 00 00 08` | no |
+| Open secure session | `00 8A <rec> <SFI<<3 \| key idx> 08 <SAM challenge> 00`; response = card challenge (+ record) | yes |
+| Update / write / append record | `00 DC`/`D2`/`E2`, MAC'd by the session | yes |
+| Increase / decrease counter | `00 32`/`30 <ctr> <SFI<<3> 03 <amount>` | yes |
+| Close secure session | `00 8E 80 00 04 <terminal MAC> 00`; response = card MAC (verified by the SAM) | yes |
+
+Standard transport SFIs: `07` Environment & Holder, `08` Event log, `09` Contracts,
+`19` Counters, `1D` Special events, `1E` Contract list.  Record *contents* are
+network-specific (Intercode in France, custom elsewhere) and are not decoded.
+
+**The secure session.** A Calypso write is only accepted if it is inside a session
+whose MAC is computed by a SAM holding the card's keys.  Flow: the SAM diversifies
+on the card serial and issues a challenge -> OPEN SECURE SESSION sends it to the
+card -> every command and response is fed to the SAM digest -> CLOSE SECURE SESSION
+carries the SAM's terminal MAC, and the card's returned MAC is checked by the SAM.
+A wrong key makes the card reject the close (`69 88`); a tampered card makes the SAM
+reject authentication.  There is no way to forge this without the keys, by design.
+
+**Byte layout caveat.** The OPEN/CLOSE P1/P2 and the SAM APDUs vary by Calypso
+revision and SAM product; the constants at the top of `calypso.py` follow the public
+Calypso spec and Eclipse Keyple and are marked to verify against your hardware before
+production writes.  The `SimulatedCalypsoCard` + `SimulatedSam` exercise the whole
+flow (read, open, update, increase, close, MAC check) in the test suite.
+
+**To build a system for your own vehicles**: buy Calypso Prime cards and a matching
+SAM from a Calypso vendor (the SAM is provisioned with your keys), put the SAM in a
+second OMNIKEY 3021, and use `PcscSam` / `omnikey3021 calypso write --sam-reader`.
+For contactless cards, the same modules apply once you move to a contactless OMNIKEY;
+Eclipse Keyple is the reference open-source Calypso stack if you outgrow this.

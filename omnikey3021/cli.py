@@ -44,11 +44,11 @@ class Session:
                 with open(self._sim_state_path, "rb") as fh:
                     self.reader = pickle.load(fh)
             else:
-                from .simulator import SimulatedDDVCard, SimulatedEmvCard
+                from .simulator import SimulatedCalypsoCard, SimulatedDDVCard, SimulatedEmvCard
 
                 card = {"sle4442": lambda: SimulatedMemoryCard(), "iso": lambda: SimulatedIsoCard(),
                         "iso-t0": lambda: SimulatedIsoCard(t0_style=True), "emv": lambda: SimulatedEmvCard(),
-                        "hbci": lambda: SimulatedDDVCard(), "empty": lambda: None}[self.args.simulate]()
+                        "hbci": lambda: SimulatedDDVCard(), "calypso": lambda: SimulatedCalypsoCard(), "empty": lambda: None}[self.args.simulate]()
                 self.reader = SimulatedReader(card)
         else:
             from .reader import OmnikeyReader
@@ -968,6 +968,116 @@ def cmd_ctapi(args):
     return result
 
 
+
+# -- Calypso -------------------------------------------------------------------------------------
+def _calypso(args, s: Session):
+    from .calypso import CalypsoCard
+
+    card = CalypsoCard(s.connect(), revision=args.revision)
+    aid = parse_hex(args.aid) if args.aid else None
+    from .calypso import AID_1TIC_ICA
+
+    card.select_application(aid or AID_1TIC_ICA)
+    return card
+
+
+def cmd_calypso_info(args):
+    with Session(args) as s:
+        card = _calypso(args, s)
+        for line in (card.identity.describe() if card.identity else []):
+            print(line)
+        print("Files:")
+        _print_kv({f"EF {k:02X}": f"{len(v)} record(s) x {len(v[0].data)} bytes" for k, v in card.dump().items()}, "  ")
+    return 0
+
+
+def cmd_calypso_dump(args):
+    with Session(args) as s:
+        card = _calypso(args, s)
+        for line in (card.identity.describe() if card.identity else []):
+            print(line)
+        for sfi, recs in card.dump().items():
+            from .calypso import STANDARD_SFIS
+
+            print(f"\nEF {sfi:02X} ({STANDARD_SFIS.get(sfi, 'file')}):")
+            for r in recs:
+                print(f"  rec {r.number:2}: {r.data.hex(' ').upper()}")
+    return 0
+
+
+def cmd_calypso_read(args):
+    with Session(args) as s:
+        card = _calypso(args, s)
+        if args.record:
+            print(card.read_record(args.sfi, args.record).hex(" ").upper())
+        else:
+            for r in card.read_records(args.sfi):
+                print(f"rec {r.number:2}: {r.data.hex(' ').upper()}")
+    return 0
+
+
+def _open_sam(args):
+    """Open the SAM in a second reader and return a PcscSam (real hardware only)."""
+    from .calypso import PcscSam
+    from .reader import OmnikeyReader
+
+    reader = OmnikeyReader(args.sam_reader) if args.sam_reader else None
+    if reader is None:
+        names = [n for n in OmnikeyReader.list() if n != args.reader]
+        if not names:
+            raise SystemExit("no SAM reader found; pass --sam-reader NAME (the reader holding the Calypso SAM)")
+        reader = OmnikeyReader(names[0])
+    sam_session = reader.connect()
+    return PcscSam(sam_session)
+
+
+def cmd_calypso_write(args):
+    if args.simulate:
+        print("writing needs a real Calypso SAM; --simulate has no SAM. Use the Python API with SimulatedSam for a dry run.")
+        return 2
+    with Session(args) as s:
+        card = _calypso(args, s)
+        sam = _open_sam(args)
+        card.open_secure_session(sam, key_index=args.key_index)
+        try:
+            data = _bytes_arg(args.data)
+            if args.append:
+                card.append_record(args.sfi, data)
+                print(f"appended {len(data)} bytes to EF {args.sfi:02X}")
+            else:
+                card.update_record(args.sfi, args.record, data)
+                print(f"updated EF {args.sfi:02X} record {args.record}")
+            card.close_secure_session()
+            print("secure session closed and authenticated by the SAM")
+        except Exception:
+            card.abort_secure_session()
+            raise
+    return 0
+
+
+def cmd_calypso_counter(args):
+    if args.simulate:
+        print("counter changes need a real Calypso SAM; --simulate has no SAM.")
+        return 2
+    with Session(args) as s:
+        card = _calypso(args, s)
+        sam = _open_sam(args)
+        card.open_secure_session(sam, key_index=args.key_index)
+        try:
+            if args.decrease:
+                val = card.decrease_counter(args.sfi, args.counter, args.decrease)
+                print(f"counter {args.counter} decreased to {int.from_bytes(val, 'big')}")
+            elif args.increase:
+                val = card.increase_counter(args.sfi, args.counter, args.increase)
+                print(f"counter {args.counter} increased to {int.from_bytes(val, 'big')}")
+            card.close_secure_session()
+            print("secure session closed and authenticated by the SAM")
+        except Exception:
+            card.abort_secure_session()
+            raise
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
@@ -979,7 +1089,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=None, help="seconds to wait for a card (default: forever)")
     p.add_argument("--trace", action="store_true", help="print every APDU exchanged")
     p.add_argument("--exclusive", action="store_true", help="connect with SCARD_SHARE_EXCLUSIVE")
-    p.add_argument("--simulate", choices=["sle4442", "iso", "iso-t0", "emv", "hbci", "empty"], help="use a simulated reader/card")
+    p.add_argument("--simulate", choices=["sle4442", "iso", "iso-t0", "emv", "hbci", "calypso", "empty"], help="use a simulated reader/card")
     p.add_argument("--sim-state", help="file that keeps the simulated card between invocations")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1207,6 +1317,43 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--set-host")
     sp.add_argument("--set-name")
     sp.set_defaults(func=cmd_hbci_bank)
+
+    # calypso
+    cal = sub.add_parser("calypso", help="Calypso transport cards (contact interface)").add_subparsers(dest="calypso_cmd", required=True)
+
+    def cal_common(sp):
+        sp.add_argument("--aid", help="application AID (hex); default 1TIC.ICA (315449432E494341)")
+        sp.add_argument("--revision", type=int, choices=[2, 3], help="force Calypso revision (2 = CLA 94, 3 = CLA 00)")
+
+    sp = cal.add_parser("info", help="select the application and show serial, startup info and files")
+    cal_common(sp)
+    sp.set_defaults(func=cmd_calypso_info)
+    sp = cal.add_parser("dump", help="read every record of the standard transport files")
+    cal_common(sp)
+    sp.set_defaults(func=cmd_calypso_dump)
+    sp = cal.add_parser("read", help="read a file by SFI")
+    cal_common(sp)
+    sp.add_argument("--sfi", type=lambda x: int(x, 0), required=True, help="short file identifier, e.g. 0x07")
+    sp.add_argument("--record", type=int, default=0, help="record number (default: all)")
+    sp.set_defaults(func=cmd_calypso_read)
+    sp = cal.add_parser("write", help="write a record inside a secure session (needs a SAM)")
+    cal_common(sp)
+    sp.add_argument("--sfi", type=lambda x: int(x, 0), required=True)
+    sp.add_argument("--record", type=int, default=1)
+    sp.add_argument("--append", action="store_true", help="APPEND instead of UPDATE")
+    sp.add_argument("--data", required=True, help="hex, 'str:text' or '@file'")
+    sp.add_argument("--sam-reader", help="reader holding the Calypso SAM (default: the other OMNIKEY reader)")
+    sp.add_argument("--key-index", type=int, default=1, help="SAM key index (1 debit, 2 load, 3 perso)")
+    sp.set_defaults(func=cmd_calypso_write)
+    sp = cal.add_parser("counter", help="increase/decrease a counter inside a secure session (needs a SAM)")
+    cal_common(sp)
+    sp.add_argument("--sfi", type=lambda x: int(x, 0), default=0x19)
+    sp.add_argument("--counter", type=int, default=0, help="counter index within the file")
+    sp.add_argument("--increase", type=int)
+    sp.add_argument("--decrease", type=int)
+    sp.add_argument("--sam-reader")
+    sp.add_argument("--key-index", type=int, default=1)
+    sp.set_defaults(func=cmd_calypso_counter)
 
     # ccid / monitor / ctapi
     sp = sub.add_parser("ccid", help="USB CCID descriptor (Linux sysfs) and PC/SC part 10 properties")
