@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from .errors import CardError
+from .errors import CardError, OmnikeyError
 
 Transmit = Callable[[bytes], bytes]
 
@@ -258,9 +258,26 @@ def transmit_apdu(transmit: Transmit, command: CommandAPDU | bytes, *, auto_get_
 
     * ``6C xx``  -> the command is re-issued with Le = xx.
     * ``61 xx``  -> GET RESPONSE is issued repeatedly and the data concatenated.
+    * an empty response to a case-4 command (seen with some CCID drivers, e.g. macOS,
+      when a T=0 card has data to return) -> the command is re-sent as case 3 and the
+      data fetched with GET RESPONSE.
     """
     cmd = command if isinstance(command, CommandAPDU) else CommandAPDU.parse(bytes(command))
     raw = transmit(cmd.to_bytes())
+    if len(raw) < 2 and cmd.case == 4:
+        # Driver swallowed the response: fall back to case 3 + explicit GET RESPONSE.
+        case3 = CommandAPDU(cmd.cla, cmd.ins, cmd.p1, cmd.p2, cmd.data, None, cmd.extended)
+        raw = transmit(case3.to_bytes())
+        if len(raw) == 2 and raw == b"\x90\x00" and auto_get_response:
+            get_resp = CommandAPDU(cmd.cla & 0x03, 0xC0, 0x00, 0x00, le=cmd.le or 256)
+            fetched = transmit(get_resp.to_bytes())
+            if len(fetched) >= 2 and fetched[-2] in (0x90, 0x61, 0x62, 0x63):
+                raw = fetched
+    if len(raw) < 2:
+        raise OmnikeyError(
+            f"card or driver returned an empty response to {cmd.hex()} - try --trace to see the exchange, "
+            "--protocol t0/t1 to force a protocol, or --cla 94 for legacy Calypso cards"
+        )
     resp = ResponseAPDU.from_bytes(raw)
     rounds = 0
     if auto_fix_le and resp.sw1 == 0x6C and not resp.data:
@@ -270,7 +287,10 @@ def transmit_apdu(transmit: Transmit, command: CommandAPDU | bytes, *, auto_get_
     while auto_get_response and resp.sw1 == 0x61 and rounds < max_rounds:
         rounds += 1
         get_resp = CommandAPDU(cmd.cla & 0x03, 0xC0, 0x00, 0x00, le=resp.sw2 or 256)
-        resp = ResponseAPDU.from_bytes(transmit(get_resp.to_bytes()))
+        fetched = transmit(get_resp.to_bytes())
+        if len(fetched) < 2:
+            raise OmnikeyError(f"empty response to GET RESPONSE after {resp.sw:04X}")
+        resp = ResponseAPDU.from_bytes(fetched)
         data += resp.data
     return ResponseAPDU(data, resp.sw1, resp.sw2)
 

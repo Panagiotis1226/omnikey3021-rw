@@ -73,6 +73,30 @@ class TestResponse(unittest.TestCase):
         self.assertEqual(sent[-1], bytes.fromhex("00C0000004"))
 
 
+class TestEmptyResponseFallback(unittest.TestCase):
+    def test_case4_empty_then_case3_get_response(self):
+        from omnikey3021.errors import OmnikeyError
+
+        sent = []
+        fci = bytes.fromhex("6F0A840831544943 2E494341".replace(" ", ""))
+
+        def tx(b):
+            sent.append(b)
+            if b == bytes.fromhex("00A4040008315449432E49434100"):
+                return b""                         # driver swallowed the case-4 response
+            if b == bytes.fromhex("00A4040008315449432E494341"):
+                return b"\x90\x00"                 # case 3 accepted
+            if b == bytes.fromhex("00C0000000"):
+                return fci + b"\x90\x00"
+            return b"\x6d\x00"
+
+        r = transmit_apdu(tx, bytes.fromhex("00A4040008315449432E49434100"))
+        self.assertEqual(r.data, fci)
+        self.assertEqual(len(sent), 3)
+        with self.assertRaises(OmnikeyError):
+            transmit_apdu(lambda b: b"", bytes.fromhex("00B0000010"))
+
+
 class TestTLV(unittest.TestCase):
     def test_encode_decode(self):
         t = tlv(0xA2, None, tlv(0xA0, None, tlv(0xA0, None, tlv(0x82))))
