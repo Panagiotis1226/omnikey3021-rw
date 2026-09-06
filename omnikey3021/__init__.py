@@ -37,7 +37,7 @@ from .iso7816 import FCI, Iso7816Card, Iso7816CardExtended
 from .memorycard import I2CCard, MemoryCard, SLE4428Card, SLE4442Card, open_memory_card
 from .vendor import ReaderConfig
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 __all__ = [
     "CommandAPDU", "ResponseAPDU", "describe_sw", "transmit_apdu",

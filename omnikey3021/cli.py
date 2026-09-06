@@ -971,13 +971,18 @@ def cmd_ctapi(args):
 
 # -- Calypso -------------------------------------------------------------------------------------
 def _calypso(args, s: Session):
-    from .calypso import CalypsoCard
+    from .calypso import AID_1TIC_ICA, CalypsoCard
 
     card = CalypsoCard(s.connect(), revision=args.revision)
-    aid = parse_hex(args.aid) if args.aid else None
-    from .calypso import AID_1TIC_ICA
-
-    card.select_application(aid or AID_1TIC_ICA)
+    aid = parse_hex(args.aid) if args.aid else AID_1TIC_ICA
+    if getattr(args, "implicit", False):
+        card.implicit_identity()
+        return card
+    ident = card.select_application(aid, required=False)
+    if ident is None:
+        print("SELECT by AID unsupported; using implicit selection (reading files directly by SFI).",
+              file=sys.stderr)
+        card.implicit_identity()
     return card
 
 
@@ -1013,6 +1018,75 @@ def cmd_calypso_read(args):
         else:
             for r in card.read_records(args.sfi):
                 print(f"rec {r.number:2}: {r.data.hex(' ').upper()}")
+    return 0
+
+
+def cmd_calypso_probe(args):
+    """Send a small matrix of selection/read commands, resetting the card between each,
+    and report which the card answers. Use this to work out how an unknown transport
+    card wants to be addressed."""
+    import time as _t
+
+    from .apdu import ResponseAPDU
+
+    probes = [
+        ("SELECT MF (00 A4 00 00 3F00)", "00 A4 00 00 02 3F 00"),
+        ("SELECT AID 1TIC.ICA CLA 00 Le", "00 A4 04 00 08 31 54 49 43 2E 49 43 41 00"),
+        ("SELECT AID 1TIC.ICA CLA 00 no Le", "00 A4 04 00 08 31 54 49 43 2E 49 43 41"),
+        ("SELECT AID 1TIC.ICA CLA 94", "94 A4 04 00 08 31 54 49 43 2E 49 43 41 00"),
+        ("SELECT AID CLA 00 P2=0C", "00 A4 04 0C 08 31 54 49 43 2E 49 43 41"),
+        ("GET CHALLENGE (00 84 00 00 08)", "00 84 00 00 08"),
+        ("READ REC sfi7 CLA 00 (00 B2 01 3C 00)", "00 B2 01 3C 00"),
+        ("READ REC sfi7 CLA 94 (94 B2 01 3C 00)", "94 B2 01 3C 00"),
+        ("READ REC sfi1 CLA 00 (00 B2 01 0C 00)", "00 B2 01 0C 00"),
+        ("SELECT EF 2001 by LID (00 A4 08 00 2001)", "00 A4 08 00 02 20 01"),
+        ("SELECT EF 2001 CLA 94", "94 A4 08 00 02 20 01"),
+    ]
+    with Session(args) as s:
+        for label, hexcmd in probes:
+            try:
+                s.channel.reconnect(reset=True)
+            except Exception:
+                pass
+            raw = parse_hex(hexcmd)
+            t0 = _t.perf_counter()
+            try:
+                resp = s.connect().transmit(raw)
+                dt = (_t.perf_counter() - t0) * 1000
+                if len(resp) >= 2:
+                    r = ResponseAPDU.from_bytes(resp)
+                    tag = "OK " if r.ok else ("warn" if r.warning else "err ")
+                    data = f" data={r.data.hex(' ').upper()}" if r.data else ""
+                    print(f"[{tag}] {label:44} SW {r.sw:04X} ({dt:5.0f} ms){data}")
+                else:
+                    print(f"[EMPTY] {label:44} {len(resp)} bytes ({dt:5.0f} ms)")
+            except Exception as exc:  # noqa: BLE001
+                dt = (_t.perf_counter() - t0) * 1000
+                print(f"[FAIL ] {label:44} {type(exc).__name__}: {exc} ({dt:5.0f} ms)")
+        # sequence phase: select then read in the SAME session (the real read flow)
+        print("--- sequence (no reset between the two commands) ---")
+        sequences = [
+            ("CLA00 SELECT AID then READ sfi7", "00 A4 04 00 08 31 54 49 43 2E 49 43 41 00", "00 B2 01 3C 00"),
+            ("CLA94 SELECT AID then READ sfi7", "94 A4 04 00 08 31 54 49 43 2E 49 43 41 00", "94 B2 01 3C 00"),
+            ("SELECT MF then READ sfi7 CLA00", "00 A4 00 00 02 3F 00", "00 B2 01 3C 00"),
+        ]
+        for label, sel, read in sequences:
+            try:
+                s.channel.reconnect(reset=True)
+            except Exception:
+                pass
+            try:
+                r1 = s.connect().transmit(parse_hex(sel))
+                s1 = ResponseAPDU.from_bytes(r1).sw if len(r1) >= 2 else None
+                r2 = s.connect().transmit(parse_hex(read))
+                if len(r2) >= 2:
+                    rr = ResponseAPDU.from_bytes(r2)
+                    print(f"  {label:36} select SW {s1:04X} -> read SW {rr.sw:04X}"
+                          + (f" data={rr.data.hex(' ').upper()}" if rr.data else ""))
+                else:
+                    print(f"  {label:36} select SW {s1 and format(s1,'04X')} -> read EMPTY ({len(r2)} bytes)")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  {label:36} {type(exc).__name__}: {exc}")
     return 0
 
 
@@ -1324,6 +1398,8 @@ def build_parser() -> argparse.ArgumentParser:
     def cal_common(sp):
         sp.add_argument("--aid", help="application AID (hex); default 1TIC.ICA (315449432E494341)")
         sp.add_argument("--revision", type=int, choices=[2, 3], help="force Calypso revision (2 = CLA 94, 3 = CLA 00)")
+        sp.add_argument("--implicit", action="store_true",
+                        help="skip SELECT-by-AID and read files directly by SFI (older Rev2 / OPUS cards)")
 
     sp = cal.add_parser("info", help="select the application and show serial, startup info and files")
     cal_common(sp)
@@ -1331,6 +1407,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = cal.add_parser("dump", help="read every record of the standard transport files")
     cal_common(sp)
     sp.set_defaults(func=cmd_calypso_dump)
+    sp = cal.add_parser("probe", help="diagnose how an unknown card wants to be addressed (resets between tries)")
+    sp.set_defaults(func=cmd_calypso_probe)
     sp = cal.add_parser("read", help="read a file by SFI")
     cal_common(sp)
     sp.add_argument("--sfi", type=lambda x: int(x, 0), required=True, help="short file identifier, e.g. 0x07")

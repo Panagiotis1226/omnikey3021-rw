@@ -173,6 +173,21 @@ def _parse_fci(fci: bytes) -> tuple[bytes, StartupInfo | None]:
     return serial, startup
 
 
+def _compact_tlv(data: bytes, want_tag: int) -> bytes:
+    """Return the value of a compact-TLV object (high nibble = tag, low nibble = length)."""
+    pos = 0
+    data = bytes(data)
+    while pos < len(data):
+        tag, length = data[pos] >> 4, data[pos] & 0x0F
+        pos += 1
+        if pos + length > len(data):
+            break
+        if tag == want_tag:
+            return data[pos:pos + length]
+        pos += length
+    return b""
+
+
 # ---------------------------------------------------------------------------
 # SAM (Secure Access Module) interface
 # ---------------------------------------------------------------------------
@@ -287,8 +302,15 @@ class CalypsoCard:
         return resp
 
     # -- selection -----------------------------------------------------------------
-    def select_application(self, aid: bytes = AID_1TIC_ICA, try_legacy: bool = True) -> CalypsoIdentity:
-        """SELECT the Calypso application by AID; falls back to CLA 94 for Rev2 cards."""
+    def select_application(self, aid: bytes = AID_1TIC_ICA, try_legacy: bool = True,
+                           required: bool = True) -> CalypsoIdentity | None:
+        """SELECT the Calypso application by AID; falls back to CLA 94 for Rev2 cards.
+
+        Some older cards (many Rev2 OPUS cards) use *implicit selection*: the
+        application is already active after reset and SELECT-by-AID is unsupported.
+        With ``required=False`` a failure returns ``None`` and you read files
+        directly by SFI (see :meth:`implicit_identity`).
+        """
         last: OmnikeyError | None = None
         for cla in (self.cla, CLA_REV2 if try_legacy else self.cla):
             try:
@@ -301,7 +323,27 @@ class CalypsoCard:
                 return self.identity
             except (CardError, OmnikeyError) as exc:
                 last = exc
-        raise UnsupportedCardError(f"no Calypso application {aid.hex().upper()} on this card ({last})")
+        if required:
+            raise UnsupportedCardError(
+                f"no Calypso application {aid.hex().upper()} selectable on this card ({last}). "
+                "If it is a transport card it may use implicit selection - retry with required=False "
+                "or the CLI --implicit flag to read files directly by SFI."
+            )
+        return None
+
+    def implicit_identity(self) -> CalypsoIdentity:
+        """Identity for an implicit-selection card (SELECT-by-AID unsupported).
+
+        The card serial is taken from the ATR historical bytes, which for these
+        cards are compact-TLV: tag 5 (nibble) carries the card serial number.
+        """
+        from .atr import parse_atr
+
+        hist = parse_atr(self.channel.atr).historical
+        serial = _compact_tlv(hist, 0x5) or hist
+        ident = CalypsoIdentity(b"", serial, None, b"", self.revision)
+        self.identity = ident
+        return ident
 
     def select_file(self, lid: int) -> bytes:
         """SELECT a file by its 2-byte Long Identifier; returns the FCI."""
