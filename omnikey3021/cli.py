@@ -44,8 +44,11 @@ class Session:
                 with open(self._sim_state_path, "rb") as fh:
                     self.reader = pickle.load(fh)
             else:
+                from .simulator import SimulatedDDVCard, SimulatedEmvCard
+
                 card = {"sle4442": lambda: SimulatedMemoryCard(), "iso": lambda: SimulatedIsoCard(),
-                        "iso-t0": lambda: SimulatedIsoCard(t0_style=True), "empty": lambda: None}[self.args.simulate]()
+                        "iso-t0": lambda: SimulatedIsoCard(t0_style=True), "emv": lambda: SimulatedEmvCard(),
+                        "hbci": lambda: SimulatedDDVCard(), "empty": lambda: None}[self.args.simulate]()
                 self.reader = SimulatedReader(card)
         else:
             from .reader import OmnikeyReader
@@ -71,7 +74,8 @@ class Session:
                 print("Waiting for card...", file=sys.stderr)
                 self.reader.wait_for_card(self.args.timeout)
                 time.sleep(0.2)
-            self.channel = self.reader.connect(PROTOCOLS[self.args.protocol])
+            share = C.SCARD_SHARE_EXCLUSIVE if self.args.exclusive else C.SCARD_SHARE_SHARED
+            self.channel = self.reader.connect(PROTOCOLS[self.args.protocol], share)
             self.channel.trace = self.args.trace
         return self.channel
 
@@ -123,6 +127,13 @@ def cmd_readers(args):
         return 0
     from .reader import OmnikeyReader
 
+    if args.groups:
+        from .pcsc import Context
+
+        with Context() as ctx:
+            for g in ctx.list_reader_groups():
+                print(g)
+        return 0
     readers = OmnikeyReader.list(args.pattern, all_readers=args.all)
     if not readers:
         print("No " + ("" if args.all else "OMNIKEY ") + "readers found.", file=sys.stderr)
@@ -152,6 +163,10 @@ def cmd_info(args):
             _print_kv({f.name: f"control code 0x{f.control_code:08X}" for f in feats.values()})
         else:
             print("  (none advertised)")
+        props = ch.tlv_properties() if hasattr(ch, "tlv_properties") else {}
+        if props:
+            print("PC/SC part 10 TLV properties (CCID):")
+            _print_kv({k: str(v) for k, v in props.items()})
         fw = ch.legacy_firmware_version()
         if fw:
             print(f"Legacy firmware version (CM_IOCTL_GET_FW_VERSION): {hexstr(fw)}")
@@ -188,6 +203,12 @@ def cmd_atr(args):
             atr = parse_atr(s.connect().atr)
     for line in atr.describe():
         print(line)
+    if args.emv:
+        issues = atr.emv_compliance()
+        print("EMV Book 1 ATR compliance: " + ("OK" if not issues else "NOT compliant"))
+        for i in issues:
+            print(f"  - {i}")
+        return 0 if not issues else 3
     return 0
 
 
@@ -711,6 +732,242 @@ def cmd_access_schedule(args):
     return 0
 
 
+
+# -- EMV -------------------------------------------------------------------------------------------
+def _emv(args, s: Session):
+    from .emv import EmvCard, TerminalData
+
+    term = TerminalData(country_code=int(args.country, 16), currency_code=int(args.currency, 16), amount=args.amount)
+    return EmvCard(s.connect(), term)
+
+
+def cmd_emv_apps(args):
+    with Session(args) as s:
+        emv = _emv(args, s)
+        apps = emv.list_applications(contactless_pse=False, probe=not args.no_probe)
+        if not apps:
+            print("no EMV application found")
+            return 3
+        for a in apps:
+            prio = f" priority {a.priority}" if a.priority is not None else ""
+            print(f"{a.aid.hex().upper():24} {a.label or '-':20} {a.scheme}{prio}")
+    return 0
+
+
+def cmd_emv_read(args):
+    with Session(args) as s:
+        emv = _emv(args, s)
+        if args.aid:
+            aid = parse_hex(args.aid)
+        else:
+            apps = emv.list_applications(probe=not args.no_probe)
+            if not apps:
+                print("no EMV application found")
+                return 3
+            aid = apps[0].aid
+        data = emv.read_application(aid)
+        for line in data.describe(mask_pan=not args.unmask):
+            print(line)
+        atc = emv.transaction_counter()
+        if atc is not None:
+            print(f"  ATC (9F36): {atc}")
+        ptc = emv.pin_try_counter()
+        if ptc is not None:
+            print(f"  PIN try counter (9F17): {ptc}")
+        last = emv.last_online_atc()
+        if last is not None:
+            print(f"  Last online ATC (9F13): {last}")
+    return 0
+
+
+def cmd_emv_log(args):
+    with Session(args) as s:
+        emv = _emv(args, s)
+        aid = parse_hex(args.aid) if args.aid else (emv.list_applications(probe=not args.no_probe) or [None])[0]
+        if aid is None:
+            print("no EMV application found")
+            return 3
+        emv.select_application(aid if isinstance(aid, bytes) else aid.aid)
+        rows = emv.transaction_log()
+        if not rows:
+            print("card exposes no transaction log")
+            return 3
+        for i, row in enumerate(rows, 1):
+            print(f"{i:3}: " + "; ".join(f"{k}={v}" for k, v in row.items()))
+    return 0
+
+
+# -- HBCI (DDV) --------------------------------------------------------------------------------------
+def _hbci(args, s: Session):
+    from .hbci import DDVCard
+
+    card = DDVCard(s.connect())
+    card.select()
+    if getattr(args, "pin", None):
+        card.verify_pin(args.pin)
+    return card
+
+
+def cmd_hbci_info(args):
+    with Session(args) as s:
+        card = _hbci(args, s)
+        _print_kv(card.info(), "")
+        tries = card.pin_tries_remaining()
+        if tries is not None:
+            print(f"PIN tries remaining : {tries}")
+    return 0
+
+
+def cmd_hbci_pin(args):
+    with Session(args) as s:
+        card = _hbci(args, s)
+        if args.pin_value is None:
+            print(f"PIN tries remaining: {card.pin_tries_remaining()}")
+            return 0
+        try:
+            card.verify_pin(args.pin_value)
+            print("PIN accepted")
+        except CardError as exc:
+            print(f"PIN rejected: {exc.description}")
+            return 2
+    return 0
+
+
+def cmd_hbci_sigid(args):
+    with Session(args) as s:
+        card = _hbci(args, s)
+        if args.set is not None:
+            card.set_signature_counter(args.set)
+        print(f"signature counter: {card.signature_counter()}")
+    return 0
+
+
+def cmd_hbci_sign(args):
+    with Session(args) as s:
+        card = _hbci(args, s)
+        mac = card.sign(parse_hex(args.hash20))
+        print(f"MAC: {mac.hex().upper()}")
+    return 0
+
+
+def cmd_hbci_keys(args):
+    with Session(args) as s:
+        card = _hbci(args, s)
+        for k in card.key_data():
+            print(k.describe())
+        if args.derive is not None:
+            plain, enc = card.get_encryption_keys(args.derive)
+            print(f"session key (plain): {plain.hex().upper()}")
+            print(f"session key (encrypted by card key {args.derive}): {enc.hex().upper()}")
+    return 0
+
+
+def cmd_hbci_bank(args):
+    with Session(args) as s:
+        card = _hbci(args, s)
+        if args.set_blz or args.set_user or args.set_host:
+            from .hbci import BankData
+
+            bd = card.bank_data(args.record - 1) or BankData(args.record, "", "0" * 8, 2, "", "", "280", "")
+            if args.set_blz:
+                bd.blz = args.set_blz
+            if args.set_user:
+                bd.user_id = args.set_user
+            if args.set_host:
+                bd.comm_addr = args.set_host
+                bd.comm_type = 2
+            if args.set_name:
+                bd.shortname = args.set_name
+            card.write_bank_data(args.record - 1, bd)
+            print("bank record updated")
+        for bd in card.all_bank_data():
+            _print_kv(bd.describe(), "")
+            print()
+    return 0
+
+
+# -- CCID / PC-SC extras ------------------------------------------------------------------------------
+def cmd_ccid(args):
+    from .ccid import HID_VENDOR_ID, find_usb_ccid_devices
+
+    rc = 0
+    if not args.simulate:
+        devs = find_usb_ccid_devices(None if args.all_usb else HID_VENDOR_ID)
+        if devs:
+            for d in devs:
+                print(f"USB {d.vendor_id:04X}:{d.product_id:04X} {d.manufacturer} {d.product} ({d.model})  serial {d.serial or '-'}  "
+                      f"firmware bcdDevice {d.bcd_device}  USB {d.usb_version} {d.speed_mbps} Mbit/s  [{d.sysfs_path}]")
+                if d.descriptor:
+                    print("  CCID class descriptor:")
+                    _print_kv(d.descriptor.describe(), "    ")
+                for w in d.warnings:
+                    print(f"  warning: {w}")
+        else:
+            print("No USB CCID device found via sysfs (Linux only); showing PC/SC view instead.")
+    with Session(args) as s:
+        ch = s.connect() if s.reader.is_card_present() else s.connect_direct()
+        props = ch.tlv_properties() if hasattr(ch, "tlv_properties") else {}
+        print("PC/SC part 10 TLV properties:")
+        _print_kv({k: str(v) for k, v in props.items()} or {"(none)": "reader/driver does not advertise GET_TLV_PROPERTIES"})
+        feats = ch.features()
+        print("PC/SC part 10 features:")
+        _print_kv({f.name: f"0x{f.control_code:08X}" for f in feats.values()} or {"(none)": "-"})
+        print("PC/SC attributes:")
+        _print_kv(ch.attributes() or {"(none)": "-"})
+    return rc
+
+
+def cmd_monitor(args):
+    if args.simulate:
+        with Session(args) as s:
+            if s.reader.is_card_present():
+                print(f"insert  {s.reader.name}  ATR {s.reader.card.atr.hex(' ').upper()}")
+            else:
+                print(f"empty   {s.reader.name}")
+        return 0
+    from .pcsc import CardMonitor
+
+    def cb(event, reader, atr):
+        stamp = time.strftime("%H:%M:%S")
+        extra = f"  ATR {atr.hex(' ').upper()}" if atr else ""
+        print(f"[{stamp}] {event:14} {reader}{extra}", flush=True)
+
+    mon = CardMonitor(cb, [args.reader] if args.reader else None, pattern=args.pattern, hotplug=not args.no_hotplug)
+    print("Monitoring card events - Ctrl+C to stop", file=sys.stderr)
+    try:
+        mon.loop()
+    except KeyboardInterrupt:
+        mon.stop()
+    return 0
+
+
+def cmd_ctapi(args):
+    from . import ctapi as ct
+
+    if args.simulate:
+        sess = Session(args).__enter__()
+        api = ct.PcscCtApi(reader_factory=lambda pn: sess.reader)
+    elif args.library:
+        api = ct.NativeCtApi(args.library)
+    else:
+        api = ct.PcscCtApi(args.reader, args.pattern)
+    rc = api.CT_init(args.ctn, args.port)
+    print(f"CT_init({args.ctn}, {args.port}) -> {ct.RETURN_CODE_NAMES.get(rc, rc)}")
+    if rc != ct.OK:
+        return 1
+    dad = {"ct": ct.CT, "icc": ct.ICC1}[args.dad]
+    result = 0
+    for text in args.commands:
+        cmd = parse_hex(text)
+        rc, _, _, resp = api.CT_data(args.ctn, dad, ct.HOST, cmd)
+        print(f">> {hexstr(cmd)}  (dad={args.dad})")
+        print(f"<< {hexstr(resp)}  rc={ct.RETURN_CODE_NAMES.get(rc, rc)}")
+        if rc != ct.OK:
+            result = 2
+    api.CT_close(args.ctn)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
@@ -721,18 +978,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--protocol", choices=PROTOCOLS, default="any", help="force T=0 / T=1 (default: card decides)")
     p.add_argument("--timeout", type=float, default=None, help="seconds to wait for a card (default: forever)")
     p.add_argument("--trace", action="store_true", help="print every APDU exchanged")
-    p.add_argument("--simulate", choices=["sle4442", "iso", "iso-t0", "empty"], help="use a simulated reader/card")
+    p.add_argument("--exclusive", action="store_true", help="connect with SCARD_SHARE_EXCLUSIVE")
+    p.add_argument("--simulate", choices=["sle4442", "iso", "iso-t0", "emv", "hbci", "empty"], help="use a simulated reader/card")
     p.add_argument("--sim-state", help="file that keeps the simulated card between invocations")
     sub = p.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("readers", help="list readers")
     sp.add_argument("--all", action="store_true", help="list every PC/SC reader, not only OMNIKEY")
+    sp.add_argument("--groups", action="store_true", help="list PC/SC reader groups instead")
     sp.set_defaults(func=cmd_readers)
 
     sub.add_parser("info", help="reader + card information").set_defaults(func=cmd_info)
     sub.add_parser("wait", help="wait for a card and show its ATR").set_defaults(func=cmd_wait)
     sp = sub.add_parser("atr", help="parse the card ATR (or a hex ATR given on the command line)")
     sp.add_argument("hex", nargs="*")
+    sp.add_argument("--emv", action="store_true", help="also check EMV Book 1 (Level 1) ATR rules")
     sp.set_defaults(func=cmd_atr)
 
     sp = sub.add_parser("apdu", help="send raw APDU(s)")
@@ -891,6 +1151,77 @@ def build_parser() -> argparse.ArgumentParser:
     sp = rd.add_parser("escape", help="send a raw CCID escape command (hex)")
     sp.add_argument("hex", nargs="+")
     sp.set_defaults(func=cmd_reader_escape)
+
+    # emv
+    emv = sub.add_parser("emv", help="EMV payment cards (read-only Level 2)").add_subparsers(dest="emv_cmd", required=True)
+
+    def emv_common(sp):
+        sp.add_argument("--aid", help="application to use (hex); default: first from PSE / probing")
+        sp.add_argument("--no-probe", action="store_true", help="do not probe well-known AIDs when the PSE is missing")
+        sp.add_argument("--country", default="0840", help="terminal country code for the PDOL (hex, default 0840 = US)")
+        sp.add_argument("--currency", default="0840", help="transaction currency code for the PDOL (hex)")
+        sp.add_argument("--amount", type=int, default=0, help="amount authorised in minor units for the PDOL")
+
+    sp = emv.add_parser("apps", help="list applications (PSE or AID probing)")
+    emv_common(sp)
+    sp.set_defaults(func=cmd_emv_apps)
+    sp = emv.add_parser("read", help="SELECT, GPO, read AFL records and decode tags")
+    emv_common(sp)
+    sp.add_argument("--unmask", action="store_true", help="print the full PAN / track 2")
+    sp.set_defaults(func=cmd_emv_read)
+    sp = emv.add_parser("log", help="read the transaction log if the card has one")
+    emv_common(sp)
+    sp.set_defaults(func=cmd_emv_log)
+
+    # hbci
+    hb = sub.add_parser("hbci", help="HBCI/FinTS DDV chip cards").add_subparsers(dest="hbci_cmd", required=True)
+
+    def hbci_common(sp, pin=True):
+        if pin:
+            sp.add_argument("--pin", help="card PIN (typed on the PC; the 3021 is a class 1 reader)")
+
+    sp = hb.add_parser("info", help="card type, card id, bank records, keys, signature counter")
+    hbci_common(sp)
+    sp.set_defaults(func=cmd_hbci_info)
+    sp = hb.add_parser("pin", help="verify the PIN (without value: show remaining tries)")
+    hbci_common(sp, pin=False)
+    sp.add_argument("pin_value", nargs="?")
+    sp.set_defaults(func=cmd_hbci_pin)
+    sp = hb.add_parser("sigid", help="read (or --set) the signature counter EF_SEQ")
+    hbci_common(sp)
+    sp.add_argument("--set", type=int)
+    sp.set_defaults(func=cmd_hbci_sigid)
+    sp = hb.add_parser("sign", help="compute the DDV MAC over a 20-byte hash (hex)")
+    hbci_common(sp)
+    sp.add_argument("hash20")
+    sp.set_defaults(func=cmd_hbci_sign)
+    sp = hb.add_parser("keys", help="show key info; --derive N derives a session key with key N")
+    hbci_common(sp)
+    sp.add_argument("--derive", type=int)
+    sp.set_defaults(func=cmd_hbci_keys)
+    sp = hb.add_parser("bank", help="show / update EF_BNK bank records")
+    hbci_common(sp)
+    sp.add_argument("--record", type=int, default=1)
+    sp.add_argument("--set-blz")
+    sp.add_argument("--set-user")
+    sp.add_argument("--set-host")
+    sp.add_argument("--set-name")
+    sp.set_defaults(func=cmd_hbci_bank)
+
+    # ccid / monitor / ctapi
+    sp = sub.add_parser("ccid", help="USB CCID descriptor (Linux sysfs) and PC/SC part 10 properties")
+    sp.add_argument("--all-usb", action="store_true", help="list every CCID device, not only HID/OMNIKEY")
+    sp.set_defaults(func=cmd_ccid)
+    sp = sub.add_parser("monitor", help="print card insert/remove and reader hot-plug events")
+    sp.add_argument("--no-hotplug", action="store_true")
+    sp.set_defaults(func=cmd_monitor)
+    sp = sub.add_parser("ctapi", help="send CT-BCS / ICC commands through the CT-API interface")
+    sp.add_argument("commands", nargs="+", help='hex, e.g. "20 12 01 01 01 0F 00" (REQUEST ICC with ATR)')
+    sp.add_argument("--dad", choices=["ct", "icc"], default="ct")
+    sp.add_argument("--ctn", type=int, default=1)
+    sp.add_argument("--port", type=int, default=0)
+    sp.add_argument("--library", help="path to a vendor CT-API shared library instead of the PC/SC bridge")
+    sp.set_defaults(func=cmd_ctapi)
 
     # access
     ac = sub.add_parser("access", help="access-control system").add_subparsers(dest="access_cmd", required=True)

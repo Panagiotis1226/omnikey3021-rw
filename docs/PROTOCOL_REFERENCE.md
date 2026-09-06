@@ -133,3 +133,96 @@ INTERNAL/EXTERNAL AUTHENTICATE, GET/PUT DATA, GET RESPONSE, ENVELOPE, MANAGE CHA
 `atr.py` decodes TS, T0, TA/TB/TC/TD chains, protocols, Fi/Di/fmax (TA1), specific mode
 (TA2), voltage class indicator (TA for T=15), T=1 IFSC/BWI/CWI/checksum, historical bytes
 and TCK validity, and recognises the synchronous pseudo ATRs above.
+
+## 7. EMVCo Level 1 / Level 2 (`emv.py`)
+
+Level 1 (electrical, T=0/T=1 timing, ATR rules) is certified in the reader itself; the
+toolkit exposes the reader's **EMVCo operating mode** (`reader slot --mode emvco`: 5 V
+only, no synchronous cards) and checks a card's ATR against **EMV Book 1 §8.3**
+(`atr --emv`, `ATR.emv_compliance()`): TS, TA1/TA2 (no negotiable mode), TB1 = 00, TC1 ∈ {00, FF},
+TD1/TD2 protocol nibbles, TC2 = 0A, TA3 ∈ 10..FE, BWI ≤ 4, CWI ≤ 5, TC3 = 00, TCK, ≤ 15 historical bytes.
+
+Level 2 read-only flow implemented by `EmvCard`:
+
+| Step | APDU |
+|---|---|
+| Select PSE / PPSE | `00 A4 04 00 0E 31 50 41 59 2E 53 59 53 2E 44 44 46 30 31 00` (`1PAY.SYS.DDF01`; `2PAY...` for the PPSE) |
+| Read directory | `00 B2 <rec> <SFI<<3 \| 04> 00` until `6A 83`; application templates `61 { 4F AID, 50 label, 87 priority }` |
+| AID probing | SELECT of each entry in `KNOWN_AIDS` when there is no PSE |
+| Select application | `00 A4 04 00 Lc AID 00` → FCI `6F { 84, A5 { 50, 87, 9F38 PDOL, 5F2D, BF0C { 9F4D log entry } } }` |
+| GET PROCESSING OPTIONS | `80 A8 00 00 Lc 83 <len> <PDOL data> 00`; response `80 AIP AFL` or `77 { 82 AIP, 94 AFL }` |
+| Read records | one READ RECORD per AFL entry (SFI, first, last, offline-auth count) |
+| GET DATA | `80 CA 9F 36` ATC, `9F 17` PIN try counter, `9F 13` last online ATC, `9F 4F` log format |
+| Transaction log | READ RECORD on the SFI named by `9F4D`, decoded with the `9F4F` format list |
+
+`TerminalData` fills PDOL/CDOL requests (9F1A, 5F2A, 9F02, 9F03, 9C, 9F35, 9F33, 9F40, 9F66,
+95, 9A, 9F37, 9F21).  The PAN is masked in CLI output unless `--unmask` is given.  No
+transaction (GENERATE AC, authentication, scripts) is ever performed.
+
+## 8. USB CCID (`ccid.py`)
+
+The 3021 is a CCID 1.1 device (USB `076B:3021`, class 0x0B, one bulk-in, one bulk-out and
+one interrupt-in endpoint).  The host does not talk CCID directly (the OS driver does), but
+the reader's declared capabilities are visible:
+
+* **CCID class descriptor** (54 bytes, type 0x21): bcdCCID, slots, `bVoltageSupport` (5 V/3 V/1.8 V),
+  `dwProtocols` (T=0/T=1), default/max clock, default/max data rate, `dwMaxIFSD`,
+  `dwSynchProtocols` (2-wire/3-wire/I2C), `dwMechanical`, `dwFeatures` (auto voltage, auto PPS,
+  auto IFSD, TPDU / short / extended APDU level, clock stop ...), `dwMaxCCIDMessageLength`,
+  `bClassGetResponse`, `bClassEnvelope`, `bPINSupport`.  Read from sysfs on Linux
+  (`omnikey3021 ccid`), or parse any descriptor dump with `parse_class_descriptor`.
+* **PC/SC part 10 GET_TLV_PROPERTIES** (control code from the feature list): USB VID/PID,
+  firmware id, max APDU size, PPDU support - cross-platform via `CardSession.tlv_properties()`.
+* **CCID escape** (`PC_to_RDR_Escape`, 0x6B): `CardSession.escape()` carries the vendor APDU
+  of section 3 when no card is inserted.
+* Message type constants (`PC_TO_RDR`, `RDR_TO_PC`) for interpreting traces.
+
+## 9. PC/SC (`pcsc.py`, `reader.py`)
+
+`SCardEstablishContext/ReleaseContext/IsValidContext/Cancel`, `SCardListReaders`,
+`SCardListReaderGroups`, `SCardGetStatusChange` (incl. `\\?PnP?\Notification` hot-plug),
+`SCardConnect` (shared / exclusive / direct), `SCardReconnect`, `SCardDisconnect` (leave /
+reset / unpower / eject), `SCardBeginTransaction/EndTransaction`, `SCardStatus`,
+`SCardTransmit` (T=0/T=1 PCI), `SCardControl`, `SCardGetAttrib/SetAttrib`.
+`CardMonitor` turns status changes into insert/remove/reader_added/reader_removed callbacks.
+
+## 10. HBCI (`hbci.py`, `ctapi.py`)
+
+HBCI/FinTS banking software uses the 3021 as a **class 1 card terminal** (no keypad/display)
+for **DDV** chip cards, normally through **CT-API** (MKT / DIN 66291).
+
+### 10.1 CT-API and CT-BCS
+
+`CT_init(ctn, pn)`, `CT_data(ctn, dad, sad, cmd) -> (rc, dad, sad, response)`, `CT_close(ctn)`.
+Addresses: 0 = ICC, 1 = CT, 2 = HOST.  Return codes 0 OK, -1 ERR_INVALID, -8 ERR_CT, -10 ERR_TRANS,
+-11 ERR_MEMORY, -127 ERR_HTSI, -128 ERR_HOST.  CT-BCS commands handled by the PC/SC bridge:
+
+| Command | APDU | Response |
+|---|---|---|
+| RESET CT | `20 11 00 00` | `90 00` |
+| RESET ICC | `20 11 01 P2` (P2 00 none / 01 ATR / 02 historical bytes) | data + `90 00` (synchronous) / `90 01` (asynchronous); `64 00` no card |
+| REQUEST ICC | `20 12 01 P2 [01 timeout]` | waits for insertion; data + `90 00`/`90 01`; `62 00` timeout |
+| GET STATUS (CT) | `20 13 00 46` | `46 len <manufacturer/type/version>` |
+| GET STATUS (ICC) | `20 13 00 80` | `80 01 xx` (00 no card, 03 present, 05 present + connected) |
+| EJECT ICC | `20 15 01 P2 [01 timeout]` | unpower; optional wait for removal |
+| PERFORM/MODIFY VERIFICATION, INPUT, OUTPUT | `20 18/19/16/17` | `6D 00` - class 1 reader has no keypad / display |
+
+`NativeCtApi` wraps a vendor CT-API library (HID's, or any `libctapi*.so`/`.dll`) with the same
+Python interface, for software that must go through the vendor library.
+
+### 10.2 DDV card commands (as in hbci4java)
+
+| Purpose | APDU |
+|---|---|
+| Select DDV type 1 / type 0 | `00 A4 04 0C 09 D2 76 00 00 25 48 42 02 00` / `... 01 00` |
+| Card id (EF_ID, SFI 19) | `00 B2 01 CC 00` |
+| Bank data (EF_BNK, SFI 1A, 88-byte records) | `00 B2 <n> D4 00`: name[0:20], BLZ[20:24] BCD, comm type[24], address[25:53], [53:55], country[55:58], user id[58:88] |
+| Signature counter (EF_SEQ, SFI 1C) | `00 B2 01 E4 00` / `00 DC 01 E4 02 hi lo` |
+| Key info | type 0: SELECT `0013`/`0014` + `00 B2 01 04 00`; type 1: `B0 EE 80 <n> 00` |
+| VERIFY PIN | `00 20 00 81 08 <2N BCD-PIN padded F>` (format-2 PIN block) |
+| MAC (sign) | UPDATE RECORD EF_MAC with hash[8:20]; type 0: `00 DA 01 00 08 hash[0:8]` then `04 B2 01 DC 00` → MAC = response[12:20]; type 1: `08 B2 01 DC 11 BA 0C B4 0A 87 08 <hash[0:8]> 96 01 00 00` → MAC = response[16:24] |
+| Session key | 2 × (`00 84 00 00 08` GET CHALLENGE, `00 88 00 8<key> 08 <challenge> 08` INTERNAL AUTHENTICATE) |
+| Decrypt session key | 2 × INTERNAL AUTHENTICATE over the 8-byte halves |
+
+The FinTS message layer (dialog initialisation, segments, HTTPS transport) is a banking client's
+job; hbci4java, AqBanking and similar can use the 3021 through PC/SC or CT-API without this toolkit.

@@ -594,3 +594,221 @@ class SimulatedReader:
                 return self._vendor(data)
             return sw(0x6D00)
         raise NoCardError(f"simulated reader: unsupported control code 0x{code:08X}")
+
+
+# ---------------------------------------------------------------------------
+# EMV payment card (read-only Level 2 behaviour)
+# ---------------------------------------------------------------------------
+class SimulatedEmvCard(SimulatedCard):
+    """Visa-style EMV application with PSE, PDOL, AFL records, GET DATA and a transaction log."""
+
+    atr = bytes.fromhex("3B6800000073C84013009000")  # typical EMV T=0 ATR (TB1=00, TC1=00, 8 historical bytes)
+    protocol = C.SCARD_PROTOCOL_T0
+    AID = bytes.fromhex("A0000000031010")
+    PAN = "4111111111111111"
+
+    def __init__(self):
+        self.selected: bytes | None = None
+        self.pdol = bytes.fromhex("9F6604" "9F0206" "9F3704")
+        self.records = {
+            (2, 1): tlv(0x70, None, tlv(0x5A, bytes.fromhex(self.PAN)), tlv(0x5F24, bytes.fromhex("281231")),
+                        tlv(0x5F20, b"SIM CARDHOLDER/EMV"), tlv(0x5F34, b"\x01"),
+                        tlv(0x57, bytes.fromhex("4111111111111111D2812201123456789F"))).encode(),
+            (2, 2): tlv(0x70, None, tlv(0x8E, bytes.fromhex("000000000000000042031E031F00")),
+                        tlv(0x9F07, b"\xff\x00"), tlv(0x5F28, b"\x02\x76"), tlv(0x8C, bytes.fromhex("9F02069F03069F1A0295055F2A029A039C019F3704")),
+                        tlv(0x9F08, b"\x00\x8C")).encode(),
+        }
+        self.log_format = bytes.fromhex("9F2701 9F0206 5F2A02 9A03 9F3602".replace(" ", ""))
+        self.log = [bytes.fromhex("80" "000000001250" "0978" "260901" "0029"),
+                    bytes.fromhex("40" "000000000499" "0978" "260903" "002A")]
+        self.atc = 42
+
+    def reset(self) -> None:
+        self.selected = None
+
+    def process(self, apdu: bytes) -> bytes:
+        try:
+            cmd = CommandAPDU.parse(apdu)
+        except ValueError:
+            return sw(0x6700)
+        if cmd.cla == 0xFF:
+            return sw(0x6E00)
+        if cmd.ins == 0xA4 and cmd.p1 == 0x04:
+            if cmd.data == b"1PAY.SYS.DDF01":
+                self.selected = cmd.data
+                fci = tlv(0x6F, None, tlv(0x84, cmd.data), tlv(0xA5, None, tlv(0x88, b"\x01"), tlv(0x5F2D, b"en")))
+                return fci.encode() + SW_OK
+            if cmd.data == self.AID:
+                self.selected = cmd.data
+                fci = tlv(0x6F, None, tlv(0x84, self.AID),
+                          tlv(0xA5, None, tlv(0x50, b"SIM VISA"), tlv(0x87, b"\x01"), tlv(0x9F38, self.pdol),
+                              tlv(0x5F2D, b"en"), tlv(0xBF0C, None, tlv(0x9F4D, b"\x0b\x02"))))
+                return fci.encode() + SW_OK
+            return sw(0x6A82)
+        if cmd.ins == 0xB2:
+            sfi, rec = cmd.p2 >> 3, cmd.p1
+            if sfi == 1:  # PSE directory
+                if rec == 1:
+                    return tlv(0x70, None, tlv(0x61, None, tlv(0x4F, self.AID), tlv(0x50, b"SIM VISA"), tlv(0x87, b"\x01"))).encode() + SW_OK
+                return sw(0x6A83)
+            if sfi == 2:
+                data = self.records.get((2, rec))
+                return data + SW_OK if data else sw(0x6A83)
+            if sfi == 11:
+                if 1 <= rec <= len(self.log):
+                    return self.log[rec - 1] + SW_OK
+                return sw(0x6A83)
+            return sw(0x6A82)
+        if cmd.cla == 0x80 and cmd.ins == 0xA8:
+            if self.selected != self.AID:
+                return sw(0x6985)
+            if not cmd.data or cmd.data[0] != 0x83 or cmd.data[1] != 14:
+                return sw(0x6700)
+            return tlv(0x77, None, tlv(0x82, b"\x1c\x00"), tlv(0x94, bytes.fromhex("10010200"))).encode() + SW_OK
+        if cmd.cla == 0x80 and cmd.ins == 0xCA:
+            tag = (cmd.p1 << 8) | cmd.p2
+            if tag == 0x9F36:
+                return tlv(0x9F36, self.atc.to_bytes(2, "big")).encode() + SW_OK
+            if tag == 0x9F17:
+                return tlv(0x9F17, b"\x03").encode() + SW_OK
+            if tag == 0x9F4F:
+                return tlv(0x9F4F, self.log_format).encode() + SW_OK
+            if tag == 0x9F13:
+                return tlv(0x9F13, b"\x00\x28").encode() + SW_OK
+            return sw(0x6A88)
+        return sw(0x6D00)
+
+
+# ---------------------------------------------------------------------------
+# HBCI DDV card (type 0) - MAC/cipher are HMAC stand-ins, the command flow is real
+# ---------------------------------------------------------------------------
+class SimulatedDDVCard(SimulatedCard):
+    atr = bytes.fromhex("3BFF1800FF8131FE45656311070101010000000000000000FF")  # SECCOS-like shape
+    protocol = C.SCARD_PROTOCOL_T1
+    AID = bytes.fromhex("D27600002548420100")
+
+    def __init__(self, pin: str = "12345"):
+        self.pin_block = bytes.fromhex(f"2{len(pin):X}" + pin.ljust(14, "F"))
+        self.pin_tries = 3
+        self.pin_ok = False
+        self.selected_app = False
+        self.current_fid: int | None = None
+        self.cid = bytes.fromhex("6720123456789012")
+        bank = bytearray(88)
+        bank[0:20] = b"SIM BANK".ljust(20)
+        bank[20:24] = bytes.fromhex("12030000")
+        bank[24] = 2
+        bank[25:53] = b"hbci.simbank.example.com".ljust(28)
+        bank[53:55] = b"  "
+        bank[55:58] = b"280"
+        bank[58:88] = b"USER0001".ljust(30)
+        self.bank_records = [bytes(bank)] + [bytes(88)] * 4
+        self.seq = bytearray(b"\x00\x2a")
+        self.mac_record = bytearray(12)
+        self.keys = {2: b"\x11" * 16, 3: b"\x22" * 16}
+        self.key_records = {0x0013: bytes([0x02, 0x10, 0x01, 0x00, 0x07]), 0x0014: bytes([0x03, 0x10, 0x01, 0x05])}
+        self.put_data: bytes = b""
+        self.sign_count = 0
+
+    def reset(self) -> None:
+        self.pin_ok = False
+        self.selected_app = False
+        self.current_fid = None
+
+    def _mac(self, key_num: int, data: bytes) -> bytes:
+        return hmac.new(self.keys[key_num], data, hashlib.sha256).digest()[:8]
+
+    def process(self, apdu: bytes) -> bytes:
+        try:
+            cmd = CommandAPDU.parse(apdu)
+        except ValueError:
+            return sw(0x6700)
+        if cmd.cla == 0xFF:
+            return sw(0x6E00)
+        if cmd.ins == 0xA4:
+            if cmd.p1 == 0x04:
+                if cmd.data == self.AID:
+                    self.selected_app = True
+                    return SW_OK
+                return sw(0x6A82)
+            if cmd.p1 in (0x00, 0x02) and len(cmd.data) == 2:
+                fid = int.from_bytes(cmd.data, "big")
+                if fid in self.key_records:
+                    self.current_fid = fid
+                    return SW_OK
+                return sw(0x6A82)
+            return sw(0x6A86)
+        if not self.selected_app:
+            return sw(0x6985)
+        if cmd.ins == 0xB2 and cmd.cla == 0x00:
+            sfi, rec = cmd.p2 >> 3, cmd.p1
+            if sfi == 0:
+                if self.current_fid in self.key_records and rec == 1:
+                    return self.key_records[self.current_fid] + SW_OK
+                return sw(0x6986)
+            if sfi == 0x19 and rec == 1:
+                return self.cid + SW_OK
+            if sfi == 0x1A and 1 <= rec <= 5:
+                return self.bank_records[rec - 1] + SW_OK
+            if sfi == 0x1B and rec == 1:
+                return bytes(self.mac_record) + SW_OK
+            if sfi == 0x1C and rec == 1:
+                return bytes(self.seq) + SW_OK
+            return sw(0x6A83)
+        if cmd.ins == 0xDC:
+            if not self.pin_ok:
+                return sw(0x6982)
+            sfi, rec = cmd.p2 >> 3, cmd.p1
+            if sfi == 0x1B and rec == 1 and len(cmd.data) == 12:
+                self.mac_record[:] = cmd.data
+                return SW_OK
+            if sfi == 0x1C and rec == 1 and len(cmd.data) == 2:
+                self.seq[:] = cmd.data
+                return SW_OK
+            if sfi == 0x1A and 1 <= rec <= 5 and len(cmd.data) == 88:
+                self.bank_records[rec - 1] = bytes(cmd.data)
+                return SW_OK
+            return sw(0x6A83)
+        if cmd.ins == 0x20 and cmd.p2 == 0x81:
+            if not cmd.data:
+                return sw(0x6983) if self.pin_tries == 0 else sw(0x63C0 | self.pin_tries)
+            if self.pin_tries == 0:
+                return sw(0x6983)
+            if cmd.data == self.pin_block:
+                self.pin_ok = True
+                self.pin_tries = 3
+                return SW_OK
+            self.pin_tries -= 1
+            return sw(0x6983) if self.pin_tries == 0 else sw(0x63C0 | self.pin_tries)
+        if cmd.ins == 0x84:
+            return os.urandom(cmd.le or 8) + SW_OK
+        if cmd.ins == 0x88 and (cmd.p2 & 0x80):
+            key = cmd.p2 & 0x7F
+            if key not in self.keys or len(cmd.data) != 8:
+                return sw(0x6A88)
+            if not self.pin_ok:
+                return sw(0x6982)
+            return self._mac(key, cmd.data) + SW_OK
+        if cmd.ins == 0xDA and (cmd.p1, cmd.p2) == (0x01, 0x00):
+            if not self.pin_ok:
+                return sw(0x6982)
+            self.put_data = cmd.data
+            return SW_OK
+        if cmd.ins == 0xB2 and cmd.cla == 0x04 and cmd.p1 == 0x01 and cmd.p2 == (0x1B << 3) | 0x04:
+            if not self.pin_ok:
+                return sw(0x6982)
+            self.sign_count += 1
+            mac = self._mac(2, self.put_data + bytes(self.mac_record))
+            return bytes(self.mac_record) + mac + SW_OK
+        if cmd.ins == 0xEE and cmd.cla == 0xB0:
+            return sw(0x6D00)  # type 0 card has no GET KEYINFO
+        return sw(0x6D00)
+
+
+def _sim_tlv_properties(self):
+    return {"sFirmwareID": "SIMULATED 1.0", "wIdVendor": "076B", "wIdProduct": "3021", "dwMaxAPDUDataSize": 65535,
+            "bPPDUSupport": 0}
+
+
+SimulatedChannel.tlv_properties = _sim_tlv_properties  # type: ignore[attr-defined]
+SimulatedChannel.status = lambda self: self.reader.card  # type: ignore[attr-defined]

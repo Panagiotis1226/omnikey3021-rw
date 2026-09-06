@@ -132,6 +132,78 @@ class ATR:
                 return out
         return None
 
+    def emv_compliance(self) -> list[str]:
+        """Check the ATR against the EMV Book 1 (section 8.3) rules for EMVCo Level 1 terminals.
+
+        Returns a list of violations (empty = compliant).  The 3021 is an EMV L1
+        certified reader; this tells you whether the *card* answers the way an EMV
+        terminal expects.
+        """
+        issues: list[str] = []
+        ib = self.interface_bytes
+        if self.kind != CardKind.ASYNC:
+            return ["not an asynchronous ISO 7816-3 card"]
+        if self.ts not in (0x3B, 0x3F):
+            issues.append(f"TS must be 3B or 3F, got {self.ts:02X}")
+        if len(self.historical) > 15:
+            issues.append("more than 15 historical bytes")
+        ta1 = ib.get("TA1")
+        ta2 = ib.get("TA2")
+        if ta1 is not None and ta1 not in (0x11, 0x13) and ta2 is None:
+            issues.append(f"TA1={ta1:02X} without TA2: terminal must keep default 372/1 (negotiable mode not allowed)")
+        if ta2 is not None:
+            if ta2 & 0x10:
+                issues.append("TA2 bit 5 set (implicit mode parameters) is not allowed")
+            if (ta2 & 0x0F) not in (0, 1):
+                issues.append(f"TA2 indicates T={ta2 & 0x0F}; only T=0/T=1 allowed")
+        tb1 = ib.get("TB1")
+        if tb1 is None:
+            issues.append("TB1 absent (EMV requires TB1 = 00 in a cold ATR)")
+        elif tb1 != 0x00:
+            issues.append(f"TB1={tb1:02X}, must be 00 (no VPP)")
+        tc1 = ib.get("TC1")
+        if tc1 is not None and tc1 not in (0x00, 0xFF):
+            issues.append(f"TC1={tc1:02X}, must be 00 or FF")
+        td1 = ib.get("TD1")
+        if td1 is not None and (td1 & 0x0F) not in (0, 1):
+            issues.append(f"TD1 indicates T={td1 & 0x0F}; only T=0/T=1 allowed")
+        if "TB2" in ib:
+            issues.append("TB2 present (not allowed)")
+        tc2 = ib.get("TC2")
+        if tc2 is not None and tc2 != 0x0A:
+            issues.append(f"TC2={tc2:02X}, must be 0A (WI=10) when present")
+        td2 = ib.get("TD2")
+        if td2 is not None:
+            proto = td2 & 0x0F
+            if td1 is not None and (td1 & 0x0F) == 1 and proto != 1:
+                issues.append("TD2 must indicate T=1 when TD1 indicates T=1")
+            if td1 is not None and (td1 & 0x0F) == 0 and proto not in (1, 14, 15):
+                issues.append("TD2 after T=0 must indicate T=1, T=14 or T=15")
+        if td1 is not None and (td1 & 0x0F) == 1:
+            ta3 = ib.get("TA3")
+            if ta3 is not None and not 0x10 <= ta3 <= 0xFE:
+                issues.append(f"TA3 (IFSC)={ta3:02X}, must be 10..FE")
+            tb3 = ib.get("TB3")
+            if tb3 is None:
+                issues.append("TB3 absent although T=1 is indicated")
+            else:
+                bwi, cwi = tb3 >> 4, tb3 & 0x0F
+                if bwi > 4:
+                    issues.append(f"BWI={bwi}, must be <= 4")
+                if cwi > 5:
+                    issues.append(f"CWI={cwi}, must be <= 5")
+                n = tc1 if tc1 is not None else 0
+                if n != 0xFF and (1 << cwi) < n + 1:
+                    issues.append("2^CWI must be >= N+1 (TC1)")
+            tc3 = ib.get("TC3")
+            if tc3 is not None and tc3 != 0x00:
+                issues.append(f"TC3={tc3:02X}, must be 00 (LRC)")
+        if self.tck is not None and not self.tck_valid:
+            issues.append("TCK checksum invalid")
+        if self.tck is None and any(p != 0 for p in self.protocols):
+            issues.append("TCK missing")
+        return issues
+
     def describe(self) -> list[str]:
         lines = [f"ATR: {self.raw.hex(' ').upper()}"]
         lines.append(f"Card kind: {self.kind.value}")

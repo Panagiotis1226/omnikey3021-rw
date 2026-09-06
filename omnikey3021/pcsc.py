@@ -105,6 +105,7 @@ def _load_library():
     lib._ReleaseContext = fn("SCardReleaseContext", LONG, [SCARDCONTEXT], "")
     lib._IsValidContext = fn("SCardIsValidContext", LONG, [SCARDCONTEXT], "")
     lib._ListReaders = fn("SCardListReaders", LONG, [SCARDCONTEXT, c_char_p, c_char_p, LPDWORD])
+    lib._ListReaderGroups = fn("SCardListReaderGroups", LONG, [SCARDCONTEXT, c_char_p, LPDWORD])
     lib._Connect = fn("SCardConnect", LONG, [SCARDCONTEXT, c_char_p, DWORD, DWORD, POINTER(SCARDHANDLE), LPDWORD])
     lib._Reconnect = fn("SCardReconnect", LONG, [SCARDHANDLE, DWORD, DWORD, DWORD, LPDWORD], "")
     lib._Disconnect = fn("SCardDisconnect", LONG, [SCARDHANDLE, DWORD], "")
@@ -222,6 +223,14 @@ class Context:
         _check(rv, "SCardListReaders")
         raw = buf.raw[: length.value]
         return [r.decode("utf-8", "replace") for r in raw.split(b"\x00") if r]
+
+    def list_reader_groups(self) -> list[str]:
+        length = DWORD(0)
+        rv = self._lib._ListReaderGroups(self._ctx, None, byref(length)) & 0xFFFFFFFF
+        _check(rv, "SCardListReaderGroups")
+        buf = create_string_buffer(max(length.value, 1))
+        _check(self._lib._ListReaderGroups(self._ctx, buf, byref(length)), "SCardListReaderGroups")
+        return [g.decode("utf-8", "replace") for g in buf.raw[: length.value].split(b"\x00") if g]
 
     def get_status_change(self, readers: Sequence[str], current_states: Sequence[int] | None = None,
                           timeout_ms: int = C.INFINITE) -> list[ReaderState]:
@@ -406,3 +415,94 @@ def find_omnikey_readers(readers: Iterable[str], pattern: str | None = None) -> 
     """
     pat = (pattern or "omnikey").lower()
     return [r for r in readers if pat in r.lower()]
+
+
+PNP_NOTIFICATION = "\\\\?PnP?\\Notification"
+
+
+class CardMonitor:
+    """Watch one or more readers for insert/remove events (SCardGetStatusChange loop).
+
+    ``callback(event, reader_name, atr)`` is invoked with event "insert", "remove",
+    "reader_added" or "reader_removed".  Run ``loop()`` in the current thread or
+    ``start()`` in a daemon thread; ``stop()`` cancels the blocking wait.
+    """
+
+    def __init__(self, callback, readers: Sequence[str] | None = None, context: Context | None = None,
+                 pattern: str | None = None, hotplug: bool = True):
+        self.callback = callback
+        self.context = context or Context()
+        self.pattern = pattern
+        self._fixed = list(readers) if readers else None
+        self.hotplug = hotplug
+        self._running = False
+        self._thread = None
+
+    def _current_readers(self) -> list[str]:
+        if self._fixed:
+            return self._fixed
+        return find_omnikey_readers(self.context.list_readers(), self.pattern)
+
+    def loop(self) -> None:
+        self._running = True
+        readers = self._current_readers()
+        states = {r: C.SCARD_STATE_UNAWARE for r in readers}
+        while self._running:
+            names = list(states)
+            if self.hotplug:
+                names.append(PNP_NOTIFICATION)
+                states.setdefault(PNP_NOTIFICATION, C.SCARD_STATE_UNAWARE)
+            if not names:
+                import time as _t
+
+                _t.sleep(1.0)
+                readers = self._current_readers()
+                states = {r: C.SCARD_STATE_UNAWARE for r in readers}
+                continue
+            try:
+                result = self.context.get_status_change(names, [states[n] for n in names], 1000)
+            except PCSCError as exc:
+                if exc.code in (C.SCARD_E_CANCELLED, C.SCARD_E_NO_SERVICE):
+                    break
+                if exc.code == C.SCARD_E_UNKNOWN_READER:
+                    for gone in [n for n in names if n != PNP_NOTIFICATION and n not in self.context.list_readers()]:
+                        self.callback("reader_removed", gone, b"")
+                        states.pop(gone, None)
+                    continue
+                raise
+            for st in result:
+                if st.reader == PNP_NOTIFICATION:
+                    if st.changed:
+                        now = self._current_readers()
+                        for r in now:
+                            if r not in states:
+                                states[r] = C.SCARD_STATE_UNAWARE
+                                self.callback("reader_added", r, b"")
+                        for r in [x for x in states if x != PNP_NOTIFICATION and x not in now]:
+                            states.pop(r)
+                            self.callback("reader_removed", r, b"")
+                    states[PNP_NOTIFICATION] = st.event_state & ~C.SCARD_STATE_CHANGED
+                    continue
+                if st.reader not in states:
+                    continue
+                was_present = bool(states[st.reader] & C.SCARD_STATE_PRESENT)
+                if st.changed or states[st.reader] == C.SCARD_STATE_UNAWARE:
+                    if st.present and not was_present:
+                        self.callback("insert", st.reader, st.atr)
+                    elif not st.present and was_present:
+                        self.callback("remove", st.reader, b"")
+                states[st.reader] = st.event_state & ~C.SCARD_STATE_CHANGED
+
+    def start(self):
+        import threading
+
+        self._thread = threading.Thread(target=self.loop, daemon=True)
+        self._thread.start()
+        return self._thread
+
+    def stop(self) -> None:
+        self._running = False
+        try:
+            self.context.cancel()
+        except Exception:  # noqa: BLE001
+            pass

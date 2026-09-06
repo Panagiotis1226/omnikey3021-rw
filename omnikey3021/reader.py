@@ -163,6 +163,19 @@ class CardSession:
         """
         return self.control(self.escape_control_code(), payload)
 
+    def tlv_properties(self) -> dict[str, object]:
+        """PC/SC part 10 GET_TLV_PROPERTIES: USB VID/PID, firmware id, max APDU size ... (if advertised)."""
+        from .ccid import parse_tlv_properties
+
+        feat = self.features().get(C.FEATURE_GET_TLV_PROPERTIES)
+        if feat is None:
+            return {}
+        try:
+            return parse_tlv_properties(self.control(feat.control_code))
+        except OmnikeyError as exc:
+            log.debug("GET_TLV_PROPERTIES failed: %s", exc)
+            return {}
+
     def legacy_firmware_version(self) -> bytes | None:
         """CM_IOCTL_GET_FW_VERSION (3001) - only answered by the legacy HID OMNIKEY driver."""
         try:

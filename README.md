@@ -13,18 +13,26 @@ or `libpcsclite`) with a built-in ctypes binding.
 
 ## What is supported
 
-Everything the reader offers according to HID's *OMNIKEY Contact Smart Card Readers
-Software Developer Guide* (PLT-03099), see [docs/PROTOCOL_REFERENCE.md](docs/PROTOCOL_REFERENCE.md):
+The reader's datasheet lists five specifications.  Each one maps to a layer of this toolkit
+(details and byte-level tables in [docs/PROTOCOL_REFERENCE.md](docs/PROTOCOL_REFERENCE.md)):
+
+| Datasheet item | What it means for the 3021 | Toolkit |
+|---|---|---|
+| **ISO 7816** | contact cards, classes A/B/C, T=0 and T=1 | `atr.py` (7816-3 ATR), `apdu.py` (short/extended APDUs), `iso7816.py` (7816-4 file/PIN/auth commands, 7816-8 security operations, 7816-9 file management), `memorycard.py` (7816-10 synchronous cards) |
+| **EMVCo Terminal Level 1** | EMV-certified card interface, EMVCo operating mode | `ReaderConfig.set_operating_mode`, `ATR.emv_compliance()` (Book 1 ATR rules), `emv.py` read-only Level 2 (PSE/PPSE, GPO, AFL records, tags, ATC, log) |
+| **USB CCID** | CCID 1.1 class device driven by the OS driver | `ccid.py` (class descriptor: voltages, clocks, data rates, IFSD, exchange level, features; sysfs discovery), PC/SC part 10 TLV properties (VID/PID, firmware id), CCID escape |
+| **PC/SC** | host API (winscard / pcsc-lite) | `pcsc.py` ctypes binding: contexts, readers and groups, status change + hot-plug monitor, shared/exclusive/direct connect, reconnect, transactions, transmit, control, attributes |
+| **HBCI** | class 1 terminal for German home banking (DDV cards via CT-API) | `ctapi.py` (CT-API `CT_init/CT_data/CT_close` + CT-BCS over PC/SC, or a vendor CT-API library), `hbci.py` (DDV card: card id, bank records, PIN, MAC/sign, session keys, signature counter) |
+
+On top of that:
 
 | Area | Support |
 |---|---|
-| Asynchronous CPU cards | T=0 and T=1, short and extended APDUs, automatic `61xx`/`6Cxx` handling, ENVELOPE for T=0; ISO 7816-4 SELECT (MF/FID/AID/path), READ/UPDATE/WRITE/ERASE BINARY, READ/UPDATE/APPEND RECORD, VERIFY, CHANGE REFERENCE DATA, RESET RETRY COUNTER, GET CHALLENGE, INTERNAL/EXTERNAL AUTHENTICATE, GET/PUT DATA, MANAGE CHANNEL, FCI/FCP parsing |
+| Asynchronous CPU cards | T=0 and T=1, short and extended APDUs, automatic `61xx`/`6Cxx` handling, ENVELOPE for T=0; SELECT (MF/FID/AID/path), READ/UPDATE/WRITE/ERASE BINARY, READ/UPDATE/APPEND/SEARCH RECORD, VERIFY, CHANGE REFERENCE DATA, RESET RETRY COUNTER, GET CHALLENGE, INTERNAL/EXTERNAL/GENERAL AUTHENTICATE, GET/PUT DATA, MANAGE CHANNEL, MSE, PSO (sign/decipher/encipher/hash/verify certificate), GENERATE KEY PAIR, CREATE/DELETE/ACTIVATE/DEACTIVATE/TERMINATE FILE, FCI/FCP parsing |
 | Synchronous memory cards | SLE 4432/4442 (2-wire), SLE 4418/4428 (3-wire), I2C EEPROMs (27 predefined types + custom): read, write, PSC verify/change, protection bits, compare-and-protect, error counter; plus raw 2WBP/3WBP/I2C bus commands |
-| Reader | discovery, card insertion/removal events, T=0/T=1 selection, warm reset, exclusive transactions, PC/SC attributes, PC/SC part 10 features, CCID escape, legacy firmware-version IOCTL |
 | Reader configuration (vendor API) | capabilities (product, firmware, serial, ...), exchange level (TPDU/APDU/extended), voltage class sequence (5 V / 3 V / 1.8 V), ISO vs EMVCo mode, 1 KiB user EEPROM, reboot, factory reset |
-| ATR | full ISO 7816-3 decoding + memory-card pseudo-ATR recognition |
 | Access control | signed 64-byte credential on the card (HMAC-SHA256, bound to the physical card), SQLite registry of holders/cards/events, revocation, expiry, per-level time schedules, optional challenge/response for CPU cards, door-controller loop with shell/webhook hooks |
-| Simulator | a simulated reader with an SLE 4442 or an ISO card so everything can be developed and tested without hardware |
+| Simulator | simulated reader with SLE 4442, ISO 7816 (T=1 or T=0 style), EMV and HBCI DDV cards so everything can be developed and tested without hardware |
 
 ## Install
 
@@ -73,6 +81,26 @@ omnikey3021 mem protect --addr 0 --length 32 --yes   # IRREVERSIBLE
 omnikey3021 mem read --kind i2c --i2c-type AT24C64 --length 128
 omnikey3021 mem i2c-types
 
+# EMV payment cards (read-only)
+omnikey3021 emv apps                   # applications from the PSE (or AID probing)
+omnikey3021 emv read --country 0276 --currency 0978   # PAN (masked), expiry, AIP, CVM list, ATC ...
+omnikey3021 emv log                    # transaction log if the card keeps one
+omnikey3021 atr --emv                  # EMV Book 1 ATR compliance check
+
+# HBCI / FinTS DDV banking cards
+omnikey3021 hbci info                  # card id, bank records (BLZ, user id, host), keys, signature counter
+omnikey3021 hbci pin 12345
+omnikey3021 hbci sign --pin 12345 <20-byte-hash-hex>
+omnikey3021 hbci keys --pin 12345 --derive 3
+omnikey3021 ctapi "20 12 01 01 01 0F 00" "20 13 00 80"     # CT-API / CT-BCS over PC/SC
+omnikey3021 ctapi --dad icc "00 A4 04 00 08 A000000003021001"
+
+# USB CCID and PC/SC
+omnikey3021 ccid                       # CCID class descriptor (Linux sysfs) + part 10 properties
+omnikey3021 monitor                    # card insert/remove and reader hot-plug events
+omnikey3021 readers --groups
+omnikey3021 --exclusive apdu "00 A4 04 00"
+
 # reader configuration (settings apply after a reader restart)
 omnikey3021 reader caps
 omnikey3021 reader slot --voltage 5V,3V,1.8V --exchange-level apdu --mode iso
@@ -82,7 +110,7 @@ omnikey3021 reader reboot
 ```
 
 Global options: `--reader NAME`, `--protocol t0|t1`, `--timeout S`, `--trace`
-(print every APDU), `--simulate sle4442|iso|iso-t0|empty` (+ `--sim-state FILE` to
+(print every APDU), `--simulate sle4442|iso|iso-t0|emv|hbci|empty` (+ `--sim-state FILE` to
 keep the simulated card between commands).
 
 ## Access-control system
@@ -128,9 +156,9 @@ with OmnikeyReader() as reader:                 # first OMNIKEY reader
         print(ReaderConfig(card).capabilities())
 ```
 
-Module map: `pcsc` (ctypes PC/SC), `reader`, `atr`, `apdu`, `tlv`, `iso7816`,
-`memorycard`, `vendor`, `access/` (`credential`, `store`, `controller`), `simulator`,
-`cli`.  More in [examples/](examples/).
+Module map: `pcsc` (ctypes PC/SC + `CardMonitor`), `reader`, `atr`, `apdu`, `tlv`, `iso7816`
+(+ `Iso7816CardExtended`), `memorycard`, `vendor`, `emv`, `ccid`, `hbci`, `ctapi`,
+`access/` (`credential`, `store`, `controller`), `simulator`, `cli`.  More in [examples/](examples/).
 
 ## Try it without a reader
 
@@ -138,14 +166,16 @@ Module map: `pcsc` (ctypes PC/SC), `reader`, `atr`, `apdu`, `tlv`, `iso7816`,
 omnikey3021 --simulate sle4442 --sim-state /tmp/card info
 omnikey3021 --simulate sle4442 --sim-state /tmp/card mem write --addr 64 --psc FFFFFF "str:hi"
 omnikey3021 --simulate iso-t0 iso read --fid 0002 --length 32
+omnikey3021 --simulate emv emv read
+omnikey3021 --simulate hbci hbci info
 python -m unittest discover -s tests
 ```
 
 ## Verified against hardware?
 
 Not yet.  Everything was built from HID's developer guide and ISO 7816 and is
-exercised against the simulator (36 tests, byte-exact checks of the APDUs printed in
-the guide).  Two details are inferred rather than documented and are marked
+exercised against the simulator (byte-exact checks of the APDUs printed in the guide,
+EMV/HBCI flows checked against the hbci4java and EMV Book conventions).  Two details are inferred rather than documented and are marked
 **(assumption)** in the protocol reference: the I2C READ payload layout and the
 3WBP control words other than the two the guide prints.  Please run
 `omnikey3021 --trace info` and `mem info` with your reader and cards and report the

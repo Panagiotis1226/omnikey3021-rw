@@ -348,3 +348,125 @@ class Iso7816Card:
 
     def manage_channel_close(self, channel: int) -> None:
         self.send(INS_MANAGE_CHANNEL, 0x80, channel)
+
+
+# ---------------------------------------------------------------------------
+# ISO 7816-8 / 7816-9 extensions
+# ---------------------------------------------------------------------------
+INS_CREATE_FILE = 0xE0
+INS_DELETE_FILE = 0xE4
+INS_DEACTIVATE_FILE = 0x04
+INS_ACTIVATE_FILE = 0x44
+INS_TERMINATE_DF = 0xE6
+INS_TERMINATE_EF = 0xE8
+INS_TERMINATE_CARD_USAGE = 0xFE
+INS_SEARCH_RECORD = 0xA2
+INS_GET_DATA_ODD = 0xCB
+INS_PUT_DATA_ODD = 0xDB
+INS_MANAGE_SECURITY_ENVIRONMENT = 0x22
+INS_PERFORM_SECURITY_OPERATION = 0x2A
+INS_GENERATE_ASYMMETRIC_KEY_PAIR = 0x46
+INS_GENERAL_AUTHENTICATE = 0x86
+
+# PERFORM SECURITY OPERATION P1P2 pairs (ISO 7816-8)
+PSO_COMPUTE_DIGITAL_SIGNATURE = (0x9E, 0x9A)
+PSO_VERIFY_DIGITAL_SIGNATURE = (0x00, 0xA8)
+PSO_HASH = (0x90, 0x80)
+PSO_ENCIPHER = (0x86, 0x80)
+PSO_DECIPHER = (0x80, 0x86)
+PSO_COMPUTE_CRYPTOGRAPHIC_CHECKSUM = (0x8E, 0x80)
+PSO_VERIFY_CRYPTOGRAPHIC_CHECKSUM = (0x00, 0xA2)
+PSO_VERIFY_CERTIFICATE = (0x00, 0xAE)
+PSO_VERIFY_CERTIFICATE_SELF_DESCRIPTIVE = (0x00, 0xBE)
+
+# MANAGE SECURITY ENVIRONMENT P1 (SET) and CRT tags
+MSE_SET_COMPUTATION = 0x41
+MSE_SET_VERIFICATION = 0x81
+MSE_SET_COMPUTATION_DECIPHER = 0xC1
+CRT_AUTHENTICATION = 0xA4
+CRT_DIGITAL_SIGNATURE = 0xB6
+CRT_CONFIDENTIALITY = 0xB8
+CRT_HASH = 0xAA
+CRT_CRYPTOGRAPHIC_CHECKSUM = 0xB4
+
+
+class Iso7816CardExtended(Iso7816Card):
+    """Adds the ISO 7816-9 file-management and 7816-8 security commands."""
+
+    # -- 7816-9 file management --------------------------------------------------------------
+    def create_file(self, fcp: bytes, p1: int = 0x00, p2: int = 0x00) -> None:
+        """CREATE FILE with an FCP template (62 ...) describing the new file."""
+        self.send(INS_CREATE_FILE, p1, p2, bytes(fcp))
+
+    def create_transparent_ef(self, fid: int, size: int, extra: list[TLV] | None = None) -> None:
+        """CREATE FILE for a transparent EF; ``extra`` adds card-specific FCP objects (e.g. 86 security attributes)."""
+        fcp = TLV(0x62, children=[TLV(0x80, size.to_bytes(2, "big")), TLV(0x82, b"\x01"),
+                                  TLV(0x83, fid.to_bytes(2, "big")), *(extra or [])])
+        self.create_file(fcp.encode())
+
+    def delete_file(self, fid: int | None = None, p1: int = 0x00) -> None:
+        """DELETE FILE (P1=00 with FID data, or P1=00 no data = current file)."""
+        self.send(INS_DELETE_FILE, p1, 0x00, fid.to_bytes(2, "big") if fid is not None else b"")
+
+    def activate_file(self, fid: int | None = None) -> None:
+        self.send(INS_ACTIVATE_FILE, 0x00, 0x00, fid.to_bytes(2, "big") if fid is not None else b"")
+
+    def deactivate_file(self, fid: int | None = None) -> None:
+        self.send(INS_DEACTIVATE_FILE, 0x00, 0x00, fid.to_bytes(2, "big") if fid is not None else b"")
+
+    def terminate_df(self) -> None:
+        self.send(INS_TERMINATE_DF, 0x00, 0x00)
+
+    def terminate_ef(self) -> None:
+        self.send(INS_TERMINATE_EF, 0x00, 0x00)
+
+    def terminate_card_usage(self) -> None:
+        self.send(INS_TERMINATE_CARD_USAGE, 0x00, 0x00)
+
+    def search_record(self, pattern: bytes, start_record: int = 1, sfi: int | None = None, mode: int = 0x04) -> list[int]:
+        """SEARCH RECORD (simple search from ``start_record``); returns matching record numbers."""
+        p2 = mode | ((sfi & 0x1F) << 3 if sfi is not None else 0)
+        resp = self.send(INS_SEARCH_RECORD, start_record, p2, bytes(pattern), 256, allow_warnings=True)
+        return list(resp.data)
+
+    # -- data objects with odd INS (BER-TLV files) -------------------------------------------
+    def get_data_odd(self, tag_list: bytes, le: int = 256) -> bytes:
+        return self.send(INS_GET_DATA_ODD, 0x3F, 0xFF, bytes(tag_list), le).data
+
+    def put_data_odd(self, data: bytes) -> None:
+        self.send(INS_PUT_DATA_ODD, 0x3F, 0xFF, bytes(data))
+
+    # -- 7816-8 security -------------------------------------------------------------------------
+    def manage_security_environment(self, p1: int, crt_tag: int, crt_data: bytes) -> None:
+        """MSE SET: e.g. (MSE_SET_COMPUTATION, CRT_DIGITAL_SIGNATURE, 84 01 <key ref> 80 01 <algo>)."""
+        self.send(INS_MANAGE_SECURITY_ENVIRONMENT, p1, crt_tag, bytes(crt_data))
+
+    def mse_restore(self, se_id: int) -> None:
+        self.send(INS_MANAGE_SECURITY_ENVIRONMENT, 0xF3, se_id)
+
+    def perform_security_operation(self, p1p2: tuple[int, int], data: bytes, le: int | None = 256) -> bytes:
+        p1, p2 = p1p2
+        return self.send(INS_PERFORM_SECURITY_OPERATION, p1, p2, bytes(data), le).data
+
+    def compute_digital_signature(self, digest_info: bytes) -> bytes:
+        return self.perform_security_operation(PSO_COMPUTE_DIGITAL_SIGNATURE, digest_info)
+
+    def decipher(self, cryptogram: bytes, padding_indicator: int | None = 0x00) -> bytes:
+        data = (bytes([padding_indicator]) if padding_indicator is not None else b"") + bytes(cryptogram)
+        return self.perform_security_operation(PSO_DECIPHER, data)
+
+    def encipher(self, plaintext: bytes) -> bytes:
+        return self.perform_security_operation(PSO_ENCIPHER, plaintext)
+
+    def hash(self, data: bytes) -> bytes:
+        return self.perform_security_operation(PSO_HASH, data)
+
+    def verify_certificate(self, certificate: bytes, self_descriptive: bool = True) -> None:
+        self.perform_security_operation(
+            PSO_VERIFY_CERTIFICATE_SELF_DESCRIPTIVE if self_descriptive else PSO_VERIFY_CERTIFICATE, certificate, None)
+
+    def generate_asymmetric_key_pair(self, crt: bytes, p1: int = 0x80, p2: int = 0x00) -> bytes:
+        return self.send(INS_GENERATE_ASYMMETRIC_KEY_PAIR, p1, p2, bytes(crt), 256).data
+
+    def general_authenticate(self, data: bytes, algorithm: int = 0x00, key_ref: int = 0x00, le: int = 256) -> bytes:
+        return self.send(INS_GENERAL_AUTHENTICATE, algorithm, key_ref, bytes(data), le).data
