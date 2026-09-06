@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from . import pcsc_constants as C
 from . import vendor as V
 from .apdu import CommandAPDU
+from .calypso import CalypsoSamMixin
 from .errors import NoCardError
 from .tlv import TLV, decode, tlv
 
@@ -817,7 +818,7 @@ SimulatedChannel.status = lambda self: self.reader.card  # type: ignore[attr-def
 # ---------------------------------------------------------------------------
 # Calypso transport card + SAM (simulated, sharing one key so the MAC flow works)
 # ---------------------------------------------------------------------------
-class SimulatedSam:
+class SimulatedSam(CalypsoSamMixin):
     """A stand-in Calypso SAM.  The MAC scheme is internal to the simulator; a real
     SAM uses DESFire/AES session keys.  Pair it with a SimulatedCalypsoCard sharing
     the same ``key`` so open/close secure session authenticates end to end."""
@@ -858,10 +859,20 @@ class SimulatedCalypsoCard(SimulatedCard):
     protocol = C.SCARD_PROTOCOL_T0
     AID = bytes.fromhex("315449432E494341")
 
-    def __init__(self, key: bytes = b"\x01" * 16, serial: bytes | None = None):
+    # Startup-info blocks for each profile (platform byte drives profile detection).
+    STARTUP_PRIME = bytes([0x1D, 0x04, 0x06, 0x00, 0x11, 0x02, 0x01])   # platform 0x04 -> Prime Rev3.1
+    STARTUP_LIGHT = bytes([0x1D, 0x01, 0x20, 0x00, 0x11, 0x02, 0x01])   # platform 0x01 -> Light
+    STARTUP_BASIC = bytes([0x1D, 0x02, 0x04, 0x00, 0x11, 0x02, 0x01])   # platform 0x02 -> Basic
+
+    # Long Identifier (file path) -> SFI, for SELECT FILE by path then READ current EF.
+    LID_TO_SFI = {0x2001: 0x07, 0x2010: 0x08, 0x2020: 0x09, 0x2069: 0x19}
+
+    def __init__(self, key: bytes = b"\x01" * 16, serial: bytes | None = None,
+                 startup: bytes | None = None, aid: bytes | None = None):
         self.key = key
         self.serial = serial or bytes.fromhex("08201223C46D4A18")
-        self.startup = bytes([0x1D, 0x04, 0x06, 0x00, 0x11, 0x02, 0x01])  # buffer, platform, apptype ...
+        self.startup = startup or self.STARTUP_PRIME
+        self.AID = aid or type(self).AID
         self.selected = False
         self.files: dict[int, list[bytearray]] = {
             0x07: [bytearray(b"\x24" + b"\x00" * 28)],                       # Environment & Holder
@@ -869,15 +880,29 @@ class SimulatedCalypsoCard(SimulatedCard):
             0x09: [bytearray(b"\x01" + b"\x00" * 28), bytearray(29)],         # Contracts
             0x19: [bytearray(bytes.fromhex("000064") + bytes.fromhex("00000A") + b"\x00" * 23)],  # Counters
         }
+        # Transparent (binary) EF addressed by SFI for READ/UPDATE BINARY.
+        self.binary: dict[int, bytearray] = {0x01: bytearray(32)}
         self.current_sfi: int | None = None
         self._session_open = False
+        self._session_secure = False
         self._seed = b""
         self._updates = bytearray()
         self._card_challenge = b""
 
+    @classmethod
+    def light(cls, **kw) -> "SimulatedCalypsoCard":
+        """A Calypso Light card (platform byte 0x01)."""
+        return cls(startup=cls.STARTUP_LIGHT, aid=bytes.fromhex("304554502E494341"), **kw)
+
+    @classmethod
+    def basic(cls, **kw) -> "SimulatedCalypsoCard":
+        """A Calypso Basic card (platform byte 0x02, reduced write command set)."""
+        return cls(startup=cls.STARTUP_BASIC, aid=bytes.fromhex("315449432E494342"), **kw)
+
     def reset(self) -> None:
         self.selected = False
         self._session_open = False
+        self._session_secure = False
 
     def _fci(self) -> bytes:
         from .tlv import tlv
@@ -906,28 +931,44 @@ class SimulatedCalypsoCard(SimulatedCard):
         if not self.selected:
             return sw(0x6985)
 
-        if ins == 0xA4:  # SELECT FILE by LID (accept, no FCI body)
+        if ins == 0xA4:  # SELECT FILE by LID (map the path to an SFI, no FCI body)
+            lid = (cmd.data[0] << 8) | cmd.data[1] if len(cmd.data) >= 2 else 0
+            self.current_sfi = self.LID_TO_SFI.get(lid)
             return SW_OK
         if ins == 0x84:  # GET CHALLENGE
             return os.urandom(cmd.le or 8) + SW_OK
 
         if ins == 0xB2:  # READ RECORDS
             sfi = cmd.p2 >> 3
+            if sfi == 0 and self.current_sfi is not None:  # current EF (selected by path)
+                sfi = self.current_sfi
             recs = self.files.get(sfi)
             resp = (bytes(recs[cmd.p1 - 1]) + SW_OK) if recs and 1 <= cmd.p1 <= len(recs) else sw(0x6A83)
             self._digest(apdu, resp)
             return resp
 
-        if ins == 0x8A:  # OPEN SECURE SESSION
+        if ins == 0xB0:  # READ BINARY (transparent EF)
+            sfi = cmd.p1 & 0x1F if cmd.p1 & 0x80 else 0x01
+            blob = self.binary.get(sfi)
+            if blob is None:
+                return sw(0x6A82)
+            offset = cmd.p2 if cmd.p1 & 0x80 else ((cmd.p1 & 0x7F) << 8) | cmd.p2
+            length = cmd.le or (len(blob) - offset)
+            resp = bytes(blob[offset:offset + length]) + SW_OK
+            self._digest(apdu, resp)
+            return resp
+
+        if ins == 0x8A:  # OPEN SECURE SESSION (also used for a no-SAM open session)
             key_index = cmd.p2 & 0x07
             self._card_challenge = os.urandom(4)
             open_response = self._card_challenge
             self._session_open = True
+            self._session_secure = False   # promoted to secure only when a MAC is presented on CLOSE
             self._updates = bytearray()
             self._seed = bytes([key_index]) + self.serial + bytes(cmd.data) + open_response
             return open_response + SW_OK
 
-        if ins in (0xDC, 0xD2, 0xE2, 0x32, 0x30):  # in-session writes
+        if ins in (0xDC, 0xD2, 0xE2, 0x32, 0x30, 0xD6):  # in-session writes
             if not self._session_open:
                 return sw(0x6982)
             resp = self._write(cmd)
@@ -937,9 +978,12 @@ class SimulatedCalypsoCard(SimulatedCard):
         if ins == 0x8E:  # CLOSE SECURE SESSION
             if not self._session_open:
                 return sw(0x6985)
-            terminal_mac = bytes(cmd.data)
-            expected = hmac.new(self.key, self._seed + bytes(self._updates), hashlib.sha256).digest()[:4]
             self._session_open = False
+            terminal_mac = bytes(cmd.data)
+            if not terminal_mac:
+                # Open session (no SAM): nothing to authenticate, just ratify.
+                return SW_OK
+            expected = hmac.new(self.key, self._seed + bytes(self._updates), hashlib.sha256).digest()[:4]
             if not hmac.compare_digest(expected, terminal_mac):
                 return sw(0x6988)  # terminal not authenticated
             card_mac = hmac.new(self.key, self._seed + bytes(self._updates) + b"CARD", hashlib.sha256).digest()[:4]
@@ -950,12 +994,28 @@ class SimulatedCalypsoCard(SimulatedCard):
         return sw(0x6D00)
 
     def _write(self, cmd: CommandAPDU) -> bytes:
+        if cmd.ins == 0xD6:  # UPDATE BINARY (transparent EF)
+            sfi = cmd.p1 & 0x1F if cmd.p1 & 0x80 else 0x01
+            blob = self.binary.setdefault(sfi, bytearray(32))
+            offset = cmd.p2 if cmd.p1 & 0x80 else ((cmd.p1 & 0x7F) << 8) | cmd.p2
+            end = offset + len(cmd.data)
+            if end > len(blob):
+                blob.extend(b"\x00" * (end - len(blob)))
+            blob[offset:end] = cmd.data
+            return SW_OK
         sfi = cmd.p2 >> 3
         recs = self.files.setdefault(sfi, [])
         if cmd.ins == 0xDC:  # UPDATE RECORD
             if not (1 <= cmd.p1 <= len(recs)):
                 return sw(0x6A83)
             recs[cmd.p1 - 1] = bytearray(cmd.data.ljust(len(recs[cmd.p1 - 1]), b"\x00"))
+            return SW_OK
+        if cmd.ins == 0xD2:  # WRITE RECORD (logical OR into the existing record)
+            if not (1 <= cmd.p1 <= len(recs)):
+                return sw(0x6A83)
+            rec = recs[cmd.p1 - 1]
+            data = bytes(cmd.data).ljust(len(rec), b"\x00")
+            recs[cmd.p1 - 1] = bytearray(a | b for a, b in zip(rec, data))
             return SW_OK
         if cmd.ins == 0xE2:  # APPEND RECORD
             recs.append(bytearray(cmd.data))
