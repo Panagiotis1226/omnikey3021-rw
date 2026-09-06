@@ -32,7 +32,25 @@ from .errors import (
 )
 from .emv import EmvCard, TerminalData
 from .hbci import DDVCard
-from .calypso import CalypsoCard, PcscSam
+from .calypso import (
+    CalypsoCard,
+    CalypsoEF,
+    CalypsoError,
+    CalypsoIdentity,
+    CalypsoNoSamError,
+    CalypsoProfile,
+    CalypsoRecord,
+    CalypsoSam,
+    CalypsoSamMixin,
+    CalypsoSession,
+    CalypsoSessionError,
+    CalypsoWriteError,
+    EFType,
+    PcscSam,
+    SecureSession,
+    StartupInfo,
+    detect_profile,
+)
 from .iso7816 import FCI, Iso7816Card, Iso7816CardExtended
 from .memorycard import I2CCard, MemoryCard, SLE4428Card, SLE4442Card, open_memory_card
 from .vendor import ReaderConfig
@@ -44,7 +62,10 @@ __all__ = [
     "ATR", "CardKind", "parse_atr",
     "CardError", "CredentialError", "NoCardError", "OmnikeyError", "PCSCError", "ReaderNotFoundError",
     "UnsupportedCardError", "VendorError",
-    "FCI", "Iso7816Card", "Iso7816CardExtended", "EmvCard", "TerminalData", "DDVCard", "CalypsoCard", "PcscSam",
+    "FCI", "Iso7816Card", "Iso7816CardExtended", "EmvCard", "TerminalData", "DDVCard",
+    "CalypsoCard", "CalypsoEF", "CalypsoError", "CalypsoIdentity", "CalypsoNoSamError", "CalypsoProfile",
+    "CalypsoRecord", "CalypsoSam", "CalypsoSamMixin", "CalypsoSession", "CalypsoSessionError",
+    "CalypsoWriteError", "EFType", "PcscSam", "SecureSession", "StartupInfo", "detect_profile",
     "I2CCard", "MemoryCard", "SLE4428Card", "SLE4442Card", "open_memory_card",
     "ReaderConfig",
     "OmnikeyReader", "CardSession", "CardMonitor", "PcscCtApi",
